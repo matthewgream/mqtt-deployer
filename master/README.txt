@@ -7,6 +7,23 @@ push new versions of it from the master. Two parts:
   B. PUBLISH versions of it from the master (every release)
 
 
+Prerequisite (one-time, whole fleet) — signing key
+--------------------------------------------------
+Make the manufacturer's Ed25519 signing key once. The private key stays here on
+the master (gitignored, mode 0600); the public key is printed as a single line
+to paste, inline, into the device config:
+
+    ./mqtt-deploy-keygen
+    # -> pubkey = pCXB53pcDYQeaLtm50L0eGbwt8G85Jvv/ov2xp+QKlw=
+
+Put that `pubkey = ...` line in the [deployer] section of iotdata-deploy.cfg. Its
+presence makes the device ENFORCE signatures: it rejects any artifact whose meta
+entry is unsigned or mis-signed, before it even fetches the blob (fail-closed).
+Once the key file exists here, every mqtt-deploy-publish below signs automatically
+(it prints "signed: yes (ed25519)"). No key, or KEY= pointing nowhere => unsigned,
+and only devices without a pubkey would accept it.
+
+
 Prerequisite (one-time, per artifact)
 -------------------------------------
 The artifact's systemd service must prefer the writable /opt/system/data copy,

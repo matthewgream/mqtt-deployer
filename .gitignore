@@ -1,3 +1,8 @@
 mqtt-deployer
 mqtt-deployer.armhf
 *.o
+
+# signing material — the private key MUST NEVER be committed
+master/*.key
+master/iotdata-deploy-sign.*
+!master/iotdata-deploy-sign.pub

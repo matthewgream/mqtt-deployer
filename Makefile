@@ -8,7 +8,7 @@ CFLAGS  = -Wall -Wextra -Wpedantic -Werror \
           -Wstrict-prototypes -Wold-style-definition \
           -Wshadow -Wpointer-arith -Wredundant-decls \
           -Wmissing-include-dirs -Wnull-dereference
-LIBS    = -lmosquitto -lcjson
+LIBS    = -lmosquitto -lcjson -lcrypto
 
 TARGET  = mqtt-deployer
 MAIN    = mqtt-deployer.c

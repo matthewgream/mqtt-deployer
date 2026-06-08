@@ -17,8 +17,11 @@
  * again" (content-addressing makes that a normal forward deploy). After every
  * evaluation the device reports its installed inventory (retained) upstream.
  *
- * v1: sha-only (Ed25519 signature verification is a planned layer); method=file
- * (whole blob in one retained message). Generic — iotdata is just one config.
+ * Integrity is content-addressed (sha). Authenticity is optional: set `pubkey`
+ * in the config (the manufacturer's ed25519 public key, inline base64) and every
+ * meta entry must carry a valid `sig` over "<arch>\n<profile>\n<sha>\n<size>" or
+ * it is rejected before the blob is even fetched. method=file (whole blob in one
+ * retained message). Generic — iotdata is just one config.
  * --------------------------------------------------------------------------------------------------------------------------------------- */
 #define _GNU_SOURCE
 #include <cjson/cJSON.h>
@@ -26,6 +29,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <mosquitto.h>
+#include <openssl/evp.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -76,6 +80,8 @@ typedef struct {
     int        retry_normal;
     int        retry_urgent;
     int        jitter;
+    bool          sign_enabled;  /* a pubkey was configured => signatures enforced */
+    unsigned char sign_pub[32];  /* raw ed25519 public key */
     profile_t  profiles[MAX_PROFILES];
     int        nprofiles;
 } config_t;
@@ -262,6 +268,64 @@ static int xz_decompress(const char *in, const char *out) {
     return (WIFEXITED(st) && WEXITSTATUS(st) == 0) ? 0 : -1;
 }
 
+/* ---- signatures (ed25519 over the meta entry) --------------------------- */
+
+/* base64-decode in -> out (max outsz). returns decoded length, or -1.
+ * EVP_DecodeBlock pads the output to a multiple of 3, so we subtract the
+ * input's '=' padding to recover the true length. */
+static int b64decode(const char *in, unsigned char *out, int outsz) {
+    int inlen = (int)strlen(in);
+    if (inlen <= 0 || inlen % 4 != 0)
+        return -1;
+    if (inlen / 4 * 3 > outsz)
+        return -1;
+    int n = EVP_DecodeBlock(out, (const unsigned char *)in, inlen);
+    if (n < 0)
+        return -1;
+    if (in[inlen - 1] == '=')
+        n--;
+    if (in[inlen - 2] == '=')
+        n--;
+    return n;
+}
+
+/* Verify the manufacturer's ed25519 signature over the canonical meta entry
+ * "<arch>\n<profile>\n<sha>\n<size>\n". Returns true when signing is NOT
+ * enforced (no pubkey configured), or when the signature is present and valid;
+ * false (fail-closed) when enforced and the signature is missing/bad. The bytes
+ * are bound by <sha>, so a valid signature authorises exactly those bytes — the
+ * blob's own sha is checked separately after download. */
+static bool sig_ok(const char *profile, const char *sha, long size, const char *sig_b64) {
+    if (!g_cfg.sign_enabled)
+        return true;
+    if (!sig_b64 || !*sig_b64) {
+        logmsg("[%s] signature required but none advertised -> reject", profile);
+        return false;
+    }
+    unsigned char sig[80];
+    int           siglen = b64decode(sig_b64, sig, (int)sizeof(sig));
+    if (siglen != 64) {
+        logmsg("[%s] malformed signature -> reject", profile);
+        return false;
+    }
+    char payload[300];
+    int  plen = snprintf(payload, sizeof(payload), "%s\n%s\n%s\n%ld\n", g_cfg.arch, profile, sha, size);
+    if (plen <= 0 || plen >= (int)sizeof(payload))
+        return false;
+    EVP_PKEY   *pk  = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, NULL, g_cfg.sign_pub, 32);
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    bool        ok  = false;
+    if (pk && ctx && EVP_DigestVerifyInit(ctx, NULL, NULL, NULL, pk) == 1)
+        ok = EVP_DigestVerify(ctx, sig, (size_t)siglen, (const unsigned char *)payload, (size_t)plen) == 1;
+    if (ctx)
+        EVP_MD_CTX_free(ctx);
+    if (pk)
+        EVP_PKEY_free(pk);
+    if (!ok)
+        logmsg("[%s] SIGNATURE VERIFICATION FAILED -> reject", profile);
+    return ok;
+}
+
 /* ---- INI config --------------------------------------------------------- */
 
 static onfail_t parse_onfail(const char *v) {
@@ -378,7 +442,19 @@ static int config_load(config_t *c, const char *path, bool verbose) {
                 c->retry_urgent = atoi(val);
             else if (strcmp(key, "jitter") == 0)
                 c->jitter = atoi(val);
-            else if (verbose)
+            else if (strcmp(key, "pubkey") == 0) {
+                /* inline base64 of the manufacturer's 32-byte ed25519 public
+                 * key. Its mere presence turns signature enforcement ON. */
+                unsigned char raw[48];
+                if (b64decode(val, raw, (int)sizeof(raw)) == 32) {
+                    memcpy(c->sign_pub, raw, 32);
+                    c->sign_enabled = true;
+                } else {
+                    if (verbose)
+                        logmsg("%s:%d: pubkey must be base64 of a 32-byte ed25519 key", path, lineno);
+                    err = 1; /* fail-closed: a broken pubkey is a hard error */
+                }
+            } else if (verbose)
                 logmsg("%s:%d: unknown [deployer] key '%s'", path, lineno, key);
         } else if (prof) {
             if (strcmp(key, "file") == 0)
@@ -516,9 +592,17 @@ static int seat(profile_t *prof, const char *candidate) {
             (void)nanosleep(&ts, NULL);
             if (!svc_active(prof->service)) {
                 logmsg("[%s] service %s not active after start", prof->name, prof->service);
-                if (prof->on_fail == ONFAIL_ROLLBACK && access(bak, F_OK) == 0) {
-                    logmsg("[%s] rolling back to .bak", prof->name);
-                    (void)rename(bak, prof->file);
+                if (prof->on_fail == ONFAIL_ROLLBACK) {
+                    if (access(bak, F_OK) == 0) {
+                        logmsg("[%s] rolling back to .bak", prof->name);
+                        (void)rename(bak, prof->file);
+                    } else {
+                        /* first deploy: no .bak to restore. Drop the override so
+                         * the service falls back to its baked /usr/local/bin copy
+                         * rather than being stuck on a broken candidate. */
+                        logmsg("[%s] no .bak; removing override to fall back to baked", prof->name);
+                        (void)unlink(prof->file);
+                    }
                     (void)svc("restart", prof->service);
                 }
                 return -1;
@@ -610,12 +694,27 @@ static void evaluate_meta(void) {
         if (cJSON_IsString(jver))
             snprintf(p->version, sizeof(p->version), "%s", jver->valuestring);
         if (up_to_date(p, entry)) {
-            if (strcmp(p->last_result, "pending") == 0 || strcmp(p->last_result, "none") == 0)
-                snprintf(p->last_result, sizeof(p->last_result), "%s", "ok");
+            /* installed file matches the advertised sha => healthy, whatever the
+             * prior state. This also clears a stale "fail" once known-good bytes
+             * are re-published (the content-addressed rollback path). */
+            snprintf(p->last_result, sizeof(p->last_result), "%s", "ok");
             continue;
         }
         if (strcmp(p->last_result, "pending") == 0)
             continue; /* already fetching */
+        /* signature gate: don't even fetch the blob unless the manufacturer
+         * signed this (arch, profile, sha, size). The downloaded bytes are then
+         * bound to <sha> by the post-download check in handle_blob(). */
+        cJSON      *jsha  = cJSON_GetObjectItem(entry, "sha");
+        cJSON      *jsize = cJSON_GetObjectItem(entry, "size");
+        cJSON      *jsig  = cJSON_GetObjectItem(entry, "sig");
+        const char *sha   = cJSON_IsString(jsha) ? jsha->valuestring : "";
+        long        size  = cJSON_IsNumber(jsize) ? (long)jsize->valuedouble : -1;
+        const char *sig   = cJSON_IsString(jsig) ? jsig->valuestring : NULL;
+        if (!sig_ok(p->name, sha, size, sig)) {
+            snprintf(p->last_result, sizeof(p->last_result), "%s", "fail");
+            continue;
+        }
         request_blob(p);
     }
     g_report_due = true;
@@ -722,27 +821,116 @@ static int run_check(const char *cfgpath) {
         printf("CHECK FAILED: %s\n", cfgpath);
         return 1;
     }
-    printf("ok: %s — %d profile(s)\n", cfgpath, c.nprofiles);
+    printf("ok: %s — %d profile(s), signatures %s\n", cfgpath, c.nprofiles,
+           c.sign_enabled ? "ENFORCED (pubkey present)" : "off (no pubkey)");
     for (int i = 0; i < c.nprofiles; i++)
         printf("  - %s -> %s%s%s\n", c.profiles[i].name, c.profiles[i].file,
                c.profiles[i].service[0] ? " [svc:" : "", c.profiles[i].service);
     return 0;
 }
 
+/* one-shot: connect, pull the retained meta, print a per-profile status table,
+ * then exit. No daemon required — meant for diagnostics (iotdata-checks calls
+ * `iotdata-deploy --config X --status`). Degrades gracefully if the broker is
+ * down (shows on-disk state, marks the broker unreachable). */
+static int run_status(const char *cfgpath) {
+    if (config_load(&g_cfg, cfgpath, false) != 0) {
+        printf("status: config invalid: %s\n", cfgpath);
+        return 1;
+    }
+    snprintf(g_meta_topic, sizeof(g_meta_topic), "%s/%s/meta", g_cfg.prefix, g_cfg.arch);
+    mosquitto_lib_init();
+    char cid[96], mac[32];
+    get_mac(mac, sizeof(mac));
+    snprintf(cid, sizeof(cid), "mqtt-deployer-status-%s", mac);
+    g_mosq = mosquitto_new(cid, true, NULL);
+    if (!g_mosq) {
+        printf("status: mosquitto_new failed\n");
+        return 1;
+    }
+    if (g_cfg.username[0])
+        mosquitto_username_pw_set(g_mosq, g_cfg.username, g_cfg.password);
+    if (g_cfg.tls)
+        (void)mosquitto_tls_set(g_mosq, g_cfg.cafile[0] ? g_cfg.cafile : NULL, NULL, NULL, NULL, NULL);
+    mosquitto_connect_callback_set(g_mosq, on_connect);
+    mosquitto_message_callback_set(g_mosq, on_message);
+    bool connected = mosquitto_connect(g_mosq, g_cfg.broker, g_cfg.port, 30) == MOSQ_ERR_SUCCESS;
+    for (int i = 0; i < 60 && connected && !g_meta; i++)
+        if (mosquitto_loop(g_mosq, 50, 1) != MOSQ_ERR_SUCCESS) {
+            connected = false;
+            break;
+        }
+
+    printf("deployer status — arch=%s prefix=%s signatures=%s\n",
+           g_cfg.arch, g_cfg.prefix, g_cfg.sign_enabled ? "ENFORCED" : "off");
+    printf("broker %s:%d — %s\n", g_cfg.broker, g_cfg.port,
+           g_meta ? "connected, meta received" : (connected ? "connected, no meta published" : "UNREACHABLE"));
+    printf("%-20s %-12s %-13s %-13s %-8s %s\n", "profile", "version", "installed", "advertised", "sig", "state");
+    for (int i = 0; i < g_cfg.nprofiles; i++) {
+        profile_t *p       = &g_cfg.profiles[i];
+        char       isha[SHA_HEX];
+        bool       present = sha256_of(p->file, isha) == 0;
+        cJSON     *e       = g_meta ? cJSON_GetObjectItem(g_meta, p->name) : NULL;
+        cJSON     *jv      = e ? cJSON_GetObjectItem(e, "version") : NULL;
+        cJSON     *js      = e ? cJSON_GetObjectItem(e, "sha") : NULL;
+        cJSON     *jsig    = e ? cJSON_GetObjectItem(e, "sig") : NULL;
+        cJSON     *jsz     = e ? cJSON_GetObjectItem(e, "size") : NULL;
+        const char *ver    = (jv && cJSON_IsString(jv)) ? jv->valuestring : "-";
+        const char *advsha = (js && cJSON_IsString(js)) ? js->valuestring : NULL;
+
+        const char *sig;
+        if (!g_cfg.sign_enabled)
+            sig = "off";
+        else if (!e)
+            sig = "-";
+        else if (!(jsig && cJSON_IsString(jsig)))
+            sig = "MISSING";
+        else {
+            long sz = (jsz && cJSON_IsNumber(jsz)) ? (long)jsz->valuedouble : -1;
+            sig     = sig_ok(p->name, advsha ? advsha : "", sz, jsig->valuestring) ? "valid" : "INVALID";
+        }
+
+        const char *state;
+        if (!e)
+            state = present ? "installed (not advertised)" : "absent, not advertised";
+        else if (!present)
+            state = "ABSENT (advertised)";
+        else if (advsha && strcmp(isha, advsha) == 0)
+            state = "up-to-date";
+        else
+            state = "UPDATE AVAILABLE";
+
+        char svcbuf[96] = "";
+        if (p->service[0])
+            snprintf(svcbuf, sizeof(svcbuf), " [%s:%s]", p->service, svc_active(p->service) ? "active" : "inactive");
+
+        char ib[13], ab[13];
+        snprintf(ib, sizeof(ib), "%.12s", present ? isha : "absent");
+        snprintf(ab, sizeof(ab), "%.12s", advsha ? advsha : "-");
+        printf("%-20s %-12s %-13s %-13s %-8s %s%s\n", p->name, ver, ib, ab, sig, state, svcbuf);
+    }
+    mosquitto_disconnect(g_mosq);
+    mosquitto_destroy(g_mosq);
+    mosquitto_lib_cleanup();
+    return 0;
+}
+
 static void usage(const char *a0) {
-    printf("usage: %s --config <file> | --check <file> | --help\n", a0);
+    printf("usage: %s --config <file> [--status] | --check <file> | --help\n", a0);
 }
 
 int main(int argc, char **argv) {
-    const char *cfgpath = NULL;
+    const char *cfgpath     = NULL;
+    bool        want_status = false;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
-        }
-        if (strcmp(argv[i], "--check") == 0 && i + 1 < argc)
+        } else if (strcmp(argv[i], "--check") == 0 && i + 1 < argc)
             return run_check(argv[++i]);
-        if (strcmp(argv[i], "--config") == 0 && i + 1 < argc)
+        else if (strcmp(argv[i], "--status") == 0)
+            want_status = true;
+        else if (strcmp(argv[i], "--config") == 0 && i + 1 < argc)
             cfgpath = argv[++i];
         else {
             usage(argv[0]);
@@ -753,6 +941,8 @@ int main(int argc, char **argv) {
         usage(argv[0]);
         return 2;
     }
+    if (want_status)
+        return run_status(cfgpath);
     if (config_load(&g_cfg, cfgpath, true) != 0) {
         logmsg("invalid config %s", cfgpath);
         return 1;

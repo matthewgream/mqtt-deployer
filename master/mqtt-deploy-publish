@@ -1,6 +1,6 @@
 #!/bin/sh
 # mqtt-deploy-publish — publish an artifact to the fleet firmware namespace so
-# devices running mqtt-deployer pick it up. sha-only for now (signature later).
+# devices running mqtt-deployer pick it up.
 #
 #   mqtt-deploy-publish <arch> <profile> <file> [method] [normal|urgent] [version]
 #
@@ -8,7 +8,13 @@
 #   <prefix>/<arch>/dist/<profile>   the xz-compressed file blob   (FIRST)
 #   <prefix>/<arch>/meta             the suite manifest (merged)   (THEN — the commit)
 #
-# Env: PREFIX (default iotdata/firmware), HOST (default localhost), PORT (1883).
+# Signing: if a signing key exists (KEY, default ./iotdata-deploy-sign.key, made
+# by mqtt-deploy-keygen) each meta entry gets an Ed25519 `sig` over the canonical
+# "<arch>\n<profile>\n<sha>\n<size>\n". Devices configured with the matching
+# `pubkey` reject anything unsigned or mis-signed. No key => no sig (legacy).
+#
+# Env: PREFIX (default iotdata/firmware), HOST (default localhost), PORT (1883),
+#      KEY (default <scriptdir>/iotdata-deploy-sign.key).
 set -eu
 
 [ $# -ge 3 ] || { echo "usage: $0 <arch> <profile> <file> [method] [normal|urgent] [version]" >&2; exit 2; }
@@ -19,6 +25,8 @@ VERSION=${6:-$(date -u +%Y%m%dT%H%M%SZ)}
 PREFIX=${PREFIX:-iotdata/firmware}
 HOST=${HOST:-localhost}
 PORT=${PORT:-1883}
+SCRIPTDIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+KEY=${KEY:-"$SCRIPTDIR/iotdata-deploy-sign.key"}
 
 [ -f "$FILE" ] || { echo "no such file: $FILE" >&2; exit 1; }
 case "$PROFILE" in *[!A-Za-z0-9_.-]*) echo "profile must be [A-Za-z0-9_.-]" >&2; exit 2;; esac
@@ -33,9 +41,18 @@ xz -9 -e -c "$FILE" > "$tmp/blob.xz"
 csha=$(sha256sum "$tmp/blob.xz" | cut -d' ' -f1)
 csize=$(stat -c%s "$tmp/blob.xz")
 
+# sign the canonical meta entry (arch\nprofile\nsha\nsize\n) if a key is present
+SIG=""
+if [ -f "$KEY" ]; then
+    # ed25519 is one-shot: pkeyutl -rawin needs a real file, not a pipe.
+    printf '%s\n%s\n%s\n%s\n' "$ARCH" "$PROFILE" "$usha" "$usize" > "$tmp/payload"
+    SIG=$(openssl pkeyutl -sign -inkey "$KEY" -rawin -in "$tmp/payload" | base64 -w0)
+fi
+
 echo "deploy: $PREFIX/$ARCH  profile=$PROFILE  version=$VERSION  type=$TYPE"
 echo "  uncompressed $usize B  sha=$usha"
 echo "  compressed   $csize B  sha=$csha"
+echo "  signed:      $([ -n "$SIG" ] && echo "yes (ed25519)" || echo "NO — unsigned (no $KEY)")"
 
 # 1) blob first (retained) so it's in place before meta points at it
 mosquitto_pub -h "$HOST" -p "$PORT" -q 1 -r -t "$PREFIX/$ARCH/dist/$PROFILE" -f "$tmp/blob.xz"
@@ -47,7 +64,9 @@ cur=$(mosquitto_sub -h "$HOST" -p "$PORT" -t "$meta_topic" -C 1 -W 2 2>/dev/null
 [ -n "${cur:-}" ] || cur='{}'
 entry=$(jq -nc --arg v "$VERSION" --argjson us "$usize" --arg u "$usha" \
               --arg c "$csha" --argjson cs "$csize" --arg m "$METHOD" --arg t "$TYPE" \
-        '{version:$v,size:$us,sha:$u,csha:$c,csize:$cs,method:$m,type:$t}')
+              --arg sig "$SIG" \
+        '{version:$v,size:$us,sha:$u,csha:$c,csize:$cs,method:$m,type:$t}
+         + (if $sig == "" then {} else {sig:$sig} end)')
 new=$(printf '%s' "$cur" | jq -c --arg p "$PROFILE" --argjson e "$entry" '. + {($p):$e}')
 mosquitto_pub -h "$HOST" -p "$PORT" -q 1 -r -t "$meta_topic" -m "$new"
 echo "  published meta -> $meta_topic"

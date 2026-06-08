@@ -1,0 +1,37 @@
+#!/bin/sh
+# mqtt-deploy-keygen — make the manufacturer's Ed25519 signing keypair.
+#
+# The PRIVATE key stays here on the master/CI (gitignored, mode 0600) and is
+# what mqtt-deploy-publish uses to sign each release. The PUBLIC key is printed
+# as a single base64 line to paste, inline, into the device deployer config:
+#
+#     pubkey = <base64>
+#
+# A device whose config carries `pubkey` enforces signatures (fail-closed); a
+# device without it ignores them. So there is just ONE config file per device,
+# and the presence of the pubkey in it is what turns signing on.
+#
+#   mqtt-deploy-keygen [keyfile]      default: ./iotdata-deploy-sign.key
+set -eu
+
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+KEY=${1:-"$DIR/iotdata-deploy-sign.key"}
+
+[ -e "$KEY" ] && { echo "refusing to overwrite existing key: $KEY" >&2; exit 1; }
+
+umask 077
+openssl genpkey -algorithm ED25519 -out "$KEY"
+chmod 600 "$KEY"
+
+# raw 32-byte public key = last 32 bytes of the DER SubjectPublicKeyInfo
+pub=$(openssl pkey -in "$KEY" -pubout -outform DER | tail -c 32 | base64 -w0)
+
+cat <<EOF
+private key: $KEY
+             (KEEP SECRET — gitignored, never ships to a device)
+
+paste this line into the [deployer] section of the device config
+(iotdata-deploy.cfg). Its presence enforces signatures on that device:
+
+pubkey = $pub
+EOF
