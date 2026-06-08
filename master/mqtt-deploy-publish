@@ -1,0 +1,54 @@
+#!/bin/sh
+# mqtt-deploy-publish — publish an artifact to the fleet firmware namespace so
+# devices running mqtt-deployer pick it up. sha-only for now (signature later).
+#
+#   mqtt-deploy-publish <arch> <profile> <file> [method] [normal|urgent] [version]
+#
+# Publishes (retained, to the master broker on localhost):
+#   <prefix>/<arch>/dist/<profile>   the xz-compressed file blob   (FIRST)
+#   <prefix>/<arch>/meta             the suite manifest (merged)   (THEN — the commit)
+#
+# Env: PREFIX (default iotdata/firmware), HOST (default localhost), PORT (1883).
+set -eu
+
+[ $# -ge 3 ] || { echo "usage: $0 <arch> <profile> <file> [method] [normal|urgent] [version]" >&2; exit 2; }
+ARCH=$1; PROFILE=$2; FILE=$3
+METHOD=${4:-file}
+TYPE=${5:-normal}
+VERSION=${6:-$(date -u +%Y%m%dT%H%M%SZ)}
+PREFIX=${PREFIX:-iotdata/firmware}
+HOST=${HOST:-localhost}
+PORT=${PORT:-1883}
+
+[ -f "$FILE" ] || { echo "no such file: $FILE" >&2; exit 1; }
+case "$PROFILE" in *[!A-Za-z0-9_.-]*) echo "profile must be [A-Za-z0-9_.-]" >&2; exit 2;; esac
+case "$METHOD" in file) ;; *) echo "only method 'file' supported for now" >&2; exit 2;; esac
+case "$TYPE" in normal|urgent) ;; *) echo "type must be normal|urgent" >&2; exit 2;; esac
+
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+
+usha=$(sha256sum "$FILE" | cut -d' ' -f1)
+usize=$(stat -c%s "$FILE")
+xz -9 -e -c "$FILE" > "$tmp/blob.xz"
+csha=$(sha256sum "$tmp/blob.xz" | cut -d' ' -f1)
+csize=$(stat -c%s "$tmp/blob.xz")
+
+echo "deploy: $PREFIX/$ARCH  profile=$PROFILE  version=$VERSION  type=$TYPE"
+echo "  uncompressed $usize B  sha=$usha"
+echo "  compressed   $csize B  sha=$csha"
+
+# 1) blob first (retained) so it's in place before meta points at it
+mosquitto_pub -h "$HOST" -p "$PORT" -q 1 -r -t "$PREFIX/$ARCH/dist/$PROFILE" -f "$tmp/blob.xz"
+echo "  published blob -> $PREFIX/$ARCH/dist/$PROFILE"
+
+# 2) merge this entry into the retained meta and republish (the commit)
+meta_topic="$PREFIX/$ARCH/meta"
+cur=$(mosquitto_sub -h "$HOST" -p "$PORT" -t "$meta_topic" -C 1 -W 2 2>/dev/null || true)
+[ -n "${cur:-}" ] || cur='{}'
+entry=$(jq -nc --arg v "$VERSION" --argjson us "$usize" --arg u "$usha" \
+              --arg c "$csha" --argjson cs "$csize" --arg m "$METHOD" --arg t "$TYPE" \
+        '{version:$v,size:$us,sha:$u,csha:$c,csize:$cs,method:$m,type:$t}')
+new=$(printf '%s' "$cur" | jq -c --arg p "$PROFILE" --argjson e "$entry" '. + {($p):$e}')
+mosquitto_pub -h "$HOST" -p "$PORT" -q 1 -r -t "$meta_topic" -m "$new"
+echo "  published meta -> $meta_topic"
+echo "done."
