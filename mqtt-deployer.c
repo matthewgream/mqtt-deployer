@@ -49,63 +49,63 @@
 #include <time.h>
 #include <unistd.h>
 
-#define MAX_PROFILES   32
-#define SHA_HEX        65 /* 64 hex + NUL */
-#define PATH_MAX_      512
+#define MAX_PROFILES 32
+#define SHA_HEX      65 /* 64 hex + NUL */
+#define PATH_MAX_    512
 
 /* ---- config ------------------------------------------------------------- */
 
 typedef enum { ONFAIL_ROLLBACK, ONFAIL_RETRY, ONFAIL_LEAVE } onfail_t;
 
 typedef struct {
-    char     name[64];
-    char     file[PATH_MAX_];
-    char     service[64];      /* systemd unit; empty = none */
-    char     verify[PATH_MAX_]; /* command; %candidate% substituted; empty = none */
+    char name[64];
+    char file[PATH_MAX_];
+    char service[64];       /* systemd unit; empty = none */
+    char verify[PATH_MAX_]; /* command; %candidate% substituted; empty = none */
     onfail_t on_fail;
-    bool     retain_bak;
-    bool     live_replace;      /* file swappable while service runs (config, or self) */
-    bool     machine_specific;  /* only honour the per-<macid> entry; ignore global */
-    mode_t   mode;              /* permissions for the seated file (default 0644) */
+    bool retain_bak;
+    bool live_replace;     /* file swappable while service runs (config, or self) */
+    bool machine_specific; /* only honour the per-<macid> entry; ignore global */
+    mode_t mode;           /* permissions for the seated file (default 0644) */
     /* runtime state */
-    char   installed_sha[SHA_HEX]; /* sha of the seated file (cache) */
-    char   version[64];            /* last applied version from meta */
-    char   last_result[16];        /* "ok" | "fail" | "pending" | "none" */
-    char   dist_topic[256];        /* blob topic currently being fetched (match on receipt) */
-    time_t next_retry;             /* 0 = none */
-    bool   pending_restart;        /* live-replace: restart deferred until after report */
+    char installed_sha[SHA_HEX]; /* sha of the seated file (cache) */
+    char version[64];            /* last applied version from meta */
+    char last_result[16];        /* "ok" | "fail" | "pending" | "none" */
+    char dist_topic[256];        /* blob topic currently being fetched (match on receipt) */
+    time_t next_retry;           /* 0 = none */
+    bool pending_restart;        /* live-replace: restart deferred until after report */
 } profile_t;
 
 typedef struct {
-    char       broker[128];
-    int        port;
-    bool       tls;
-    char       cafile[PATH_MAX_];
-    char       username[64];
-    char       password[128];
-    char       arch[32];
-    char       prefix[64];        /* default iotdata/firmware */
-    char       status_topic[256]; /* %mac% / %host% substituted */
-    char       client_id[96];
-    int        retry_normal;
-    int        retry_urgent;
-    int        jitter;
-    bool          sign_enabled;  /* a pubkey was configured => signatures enforced */
-    unsigned char sign_pub[32];  /* raw ed25519 public key */
-    char       macid[32];        /* this device's mac (hex), for the per-machine stream */
-    profile_t  profiles[MAX_PROFILES];
-    int        nprofiles;
+    char broker[128];
+    int port;
+    bool tls;
+    char cafile[PATH_MAX_];
+    char username[64];
+    char password[128];
+    char arch[32];
+    char prefix[64];        /* default iotdata/firmware */
+    char status_topic[256]; /* %mac% / %host% substituted */
+    char client_id[96];
+    int retry_normal;
+    int retry_urgent;
+    int jitter;
+    bool sign_enabled;          /* a pubkey was configured => signatures enforced */
+    unsigned char sign_pub[32]; /* raw ed25519 public key */
+    char macid[32];             /* this device's mac (hex), for the per-machine stream */
+    profile_t profiles[MAX_PROFILES];
+    int nprofiles;
 } config_t;
 
-static config_t      g_cfg;
+static config_t g_cfg;
 static struct mosquitto *g_mosq;
 static volatile sig_atomic_t g_stop;
-static char          g_meta_topic[160];         /* global  <prefix>/<arch>/meta */
-static char          g_meta_topic_machine[160]; /* machine <prefix>/<arch>/meta/<macid> */
-static cJSON        *g_meta_global;  /* latest parsed global meta (owned, NULL if cleared) */
-static cJSON        *g_meta_machine; /* latest parsed per-machine meta (owned, NULL if cleared) */
-static bool          g_meta_dirty;   /* set on new/cleared meta, cleared after evaluate */
-static bool          g_report_due;
+static char g_meta_topic[160];         /* global  <prefix>/<arch>/meta */
+static char g_meta_topic_machine[160]; /* machine <prefix>/<arch>/meta/<macid> */
+static cJSON *g_meta_global;           /* latest parsed global meta (owned, NULL if cleared) */
+static cJSON *g_meta_machine;          /* latest parsed per-machine meta (owned, NULL if cleared) */
+static bool g_meta_dirty;              /* set on new/cleared meta, cleared after evaluate */
+static bool g_report_due;
 
 static void logmsg(const char *fmt, ...) {
     va_list ap;
@@ -131,8 +131,8 @@ static char *lstrip(char *s) {
 
 /* device MAC (eth0 else wlan0), hex lowercase — same derivation as set-hostname */
 static void get_mac(char *buf, size_t bufsz) {
-    buf[0]              = '\0';
-    const char *ifs[]   = {"eth0", "wlan0", NULL};
+    buf[0] = '\0';
+    const char *ifs[] = { "eth0", "wlan0", NULL };
     for (int i = 0; ifs[i]; i++) {
         char path[64];
         snprintf(path, sizeof(path), "/sys/class/net/%s/address", ifs[i]);
@@ -215,15 +215,17 @@ static int run_capture(char *const argv[], char *buf, size_t bufsz) {
 }
 
 /* run argv, no capture, return exit code */
-static int run_cmd(char *const argv[]) { return run_capture(argv, NULL, 0); }
+static int run_cmd(char *const argv[]) {
+    return run_capture(argv, NULL, 0);
+}
 
 /* sha256 hex of a file into out[SHA_HEX]. returns 0 ok, -1 missing/error */
 static int sha256_of(const char *path, char out[SHA_HEX]) {
     out[0] = '\0';
     if (access(path, R_OK) != 0)
         return -1;
-    char        buf[256];
-    char *const argv[] = {"sha256sum", (char *)path, NULL};
+    char buf[256];
+    char *const argv[] = { "sha256sum", (char *)path, NULL };
     if (run_capture(argv, buf, sizeof(buf)) != 0)
         return -1;
     int i = 0;
@@ -270,7 +272,7 @@ static int xz_decompress(const char *in, const char *out) {
     if (pid == 0) {
         dup2(ofd, STDOUT_FILENO);
         close(ofd);
-        char *const argv[] = {"xz", "-dc", (char *)in, NULL};
+        char *const argv[] = { "xz", "-dc", (char *)in, NULL };
         execvp(argv[0], argv);
         _exit(127);
     }
@@ -309,8 +311,7 @@ static int b64decode(const char *in, unsigned char *out, int outsz) {
  * meta-topic binds the entry to its stream (global vs this machine), ts binds the
  * precedence version, and <sha> binds the bytes — the blob's own sha is checked
  * separately after download. */
-static bool sig_ok(const char *meta_topic, const char *profile, const char *sha, long size, double ts,
-                   const char *sig_b64) {
+static bool sig_ok(const char *meta_topic, const char *profile, const char *sha, long size, double ts, const char *sig_b64) {
     if (!g_cfg.sign_enabled)
         return true;
     if (!sig_b64 || !*sig_b64) {
@@ -318,19 +319,18 @@ static bool sig_ok(const char *meta_topic, const char *profile, const char *sha,
         return false;
     }
     unsigned char sig[80];
-    int           siglen = b64decode(sig_b64, sig, (int)sizeof(sig));
+    int siglen = b64decode(sig_b64, sig, (int)sizeof(sig));
     if (siglen != 64) {
         logmsg("[%s] malformed signature -> reject", profile);
         return false;
     }
     char payload[400];
-    int  plen = snprintf(payload, sizeof(payload), "%s\n%s\n%s\n%ld\n%lld\n",
-                         meta_topic, profile, sha, size, (long long)ts);
+    int plen = snprintf(payload, sizeof(payload), "%s\n%s\n%s\n%ld\n%lld\n", meta_topic, profile, sha, size, (long long)ts);
     if (plen <= 0 || plen >= (int)sizeof(payload))
         return false;
-    EVP_PKEY   *pk  = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, NULL, g_cfg.sign_pub, 32);
+    EVP_PKEY *pk = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, NULL, g_cfg.sign_pub, 32);
     EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-    bool        ok  = false;
+    bool ok = false;
     if (pk && ctx && EVP_DigestVerifyInit(ctx, NULL, NULL, NULL, pk) == 1)
         ok = EVP_DigestVerify(ctx, sig, (size_t)siglen, (const unsigned char *)payload, (size_t)plen) == 1;
     if (ctx)
@@ -363,7 +363,7 @@ static void config_defaults(config_t *c) {
     snprintf(c->arch, sizeof(c->arch), "%s", "armv6");
     c->retry_normal = 10800; /* 3h */
     c->retry_urgent = 300;   /* 5m */
-    c->jitter       = 0;
+    c->jitter = 0;
 }
 
 /* returns 0 ok, -1 parse/validation error (msg to stderr) */
@@ -375,11 +375,11 @@ static int config_load(config_t *c, const char *path, bool verbose) {
             logmsg("cannot open config %s: %s", path, strerror(errno));
         return -1;
     }
-    char       line[1024];
-    int        in_deployer = 0;
-    profile_t *prof        = NULL;
-    int        lineno      = 0;
-    int        err         = 0;
+    char line[1024];
+    int in_deployer = 0;
+    profile_t *prof = NULL;
+    int lineno = 0;
+    int err = 0;
     while (fgets(line, sizeof(line), f)) {
         lineno++;
         char *s = lstrip(line);
@@ -394,10 +394,10 @@ static int config_load(config_t *c, const char *path, bool verbose) {
                 err = 1;
                 continue;
             }
-            *end           = '\0';
-            char *sec      = s + 1;
-            in_deployer    = 0;
-            prof           = NULL;
+            *end = '\0';
+            char *sec = s + 1;
+            in_deployer = 0;
+            prof = NULL;
             if (strcmp(sec, "deployer") == 0) {
                 in_deployer = 1;
             } else if (strncmp(sec, "profile:", 8) == 0) {
@@ -409,9 +409,9 @@ static int config_load(config_t *c, const char *path, bool verbose) {
                 }
                 prof = &c->profiles[c->nprofiles++];
                 snprintf(prof->name, sizeof(prof->name), "%s", sec + 8);
-                prof->on_fail    = ONFAIL_ROLLBACK;
+                prof->on_fail = ONFAIL_ROLLBACK;
                 prof->retain_bak = true;
-                prof->mode       = 0644;
+                prof->mode = 0644;
                 snprintf(prof->last_result, sizeof(prof->last_result), "%s", "none");
             } else {
                 if (verbose)
@@ -427,7 +427,7 @@ static int config_load(config_t *c, const char *path, bool verbose) {
             err = 1;
             continue;
         }
-        *eq       = '\0';
+        *eq = '\0';
         char *key = s;
         rstrip(key);
         char *val = lstrip(eq + 1);
@@ -519,8 +519,7 @@ static int config_load(config_t *c, const char *path, bool verbose) {
 /* ---- seating ------------------------------------------------------------ */
 
 /* split a command string into argv (whitespace), substituting %candidate% */
-static int build_argv(const char *cmd, const char *candidate, char *store, size_t storesz,
-                      char *argv[], int maxargv) {
+static int build_argv(const char *cmd, const char *candidate, char *store, size_t storesz, char *argv[], int maxargv) {
     char tmp[1024];
     size_t o = 0;
     for (const char *p = cmd; *p && o + 1 < sizeof(tmp);) {
@@ -533,25 +532,25 @@ static int build_argv(const char *cmd, const char *candidate, char *store, size_
     }
     tmp[o] = '\0';
     /* tokenize into store */
-    int   argc = 0;
-    char *w    = store;
+    int argc = 0;
+    char *w = store;
     snprintf(store, storesz, "%s", tmp);
     char *tok = strtok(w, " \t");
     while (tok && argc < maxargv - 1) {
         argv[argc++] = tok;
-        tok          = strtok(NULL, " \t");
+        tok = strtok(NULL, " \t");
     }
     argv[argc] = NULL;
     return argc;
 }
 
 static int svc(const char *action, const char *unit) {
-    char *const argv[] = {"systemctl", (char *)action, (char *)unit, NULL};
+    char *const argv[] = { "systemctl", (char *)action, (char *)unit, NULL };
     return run_cmd(argv);
 }
 static bool svc_active(const char *unit) {
-    char *const argv[] = {"systemctl", "is-active", (char *)unit, NULL};
-    char        out[32];
+    char *const argv[] = { "systemctl", "is-active", (char *)unit, NULL };
+    char out[32];
     run_capture(argv, out, sizeof(out));
     return strncmp(out, "active", 6) == 0;
 }
@@ -584,7 +583,7 @@ static int seat(profile_t *prof, const char *candidate) {
     /* Executables must be stopped before replace (busy file); configs/self use
      * live-replace = swap-while-running then restart-to-reload (and we can't
      * stop our own service mid-seat anyway). */
-    bool use_stop   = prof->service[0] && !prof->live_replace;
+    bool use_stop = prof->service[0] && !prof->live_replace;
     bool was_active = prof->service[0] && svc_active(prof->service);
     if (use_stop && was_active)
         (void)svc("stop", prof->service);
@@ -608,7 +607,7 @@ static int seat(profile_t *prof, const char *candidate) {
             prof->pending_restart = true;
         } else {
             (void)svc("start", prof->service);
-            struct timespec ts = {1, 0};
+            struct timespec ts = { 1, 0 };
             (void)nanosleep(&ts, NULL);
             if (!svc_active(prof->service)) {
                 logmsg("[%s] service %s not active after start", prof->name, prof->service);
@@ -640,16 +639,16 @@ static int seat(profile_t *prof, const char *candidate) {
 static void report_inventory(void) {
     if (g_cfg.status_topic[0] == '\0')
         return;
-    cJSON *root  = cJSON_CreateObject();
+    cJSON *root = cJSON_CreateObject();
     cJSON *profs = cJSON_AddObjectToObject(root, "profiles");
-    char   mac[32];
+    char mac[32];
     get_mac(mac, sizeof(mac));
     cJSON_AddStringToObject(root, "mac", mac);
     cJSON_AddStringToObject(root, "arch", g_cfg.arch);
     cJSON_AddNumberToObject(root, "ts", (double)time(NULL));
     for (int i = 0; i < g_cfg.nprofiles; i++) {
         profile_t *p = &g_cfg.profiles[i];
-        char       sha[SHA_HEX];
+        char sha[SHA_HEX];
         if (sha256_of(p->file, sha) != 0)
             snprintf(sha, sizeof(sha), "%s", "absent");
         cJSON *e = cJSON_AddObjectToObject(profs, p->name);
@@ -673,7 +672,7 @@ static void report_inventory(void) {
 /* the chosen meta entry for a profile, and which stream it came from */
 typedef struct {
     cJSON *entry;
-    bool   from_machine;
+    bool from_machine;
 } eff_t;
 
 static double entry_ts(cJSON *e) {
@@ -687,7 +686,7 @@ static double entry_ts(cJSON *e) {
 static eff_t effective_entry(const profile_t *prof) {
     cJSON *g = g_meta_global ? cJSON_GetObjectItem(g_meta_global, prof->name) : NULL;
     cJSON *m = g_meta_machine ? cJSON_GetObjectItem(g_meta_machine, prof->name) : NULL;
-    eff_t  r;
+    eff_t r;
     if (prof->machine_specific) {
         r.entry = m;
         r.from_machine = true;
@@ -721,7 +720,7 @@ static void meta_topic_for(bool from_machine, char *out, size_t outsz) {
 
 /* does the installed file already match the meta entry's sha/size? */
 static bool up_to_date(profile_t *prof, cJSON *entry) {
-    cJSON *jsha  = cJSON_GetObjectItem(entry, "sha");
+    cJSON *jsha = cJSON_GetObjectItem(entry, "sha");
     cJSON *jsize = cJSON_GetObjectItem(entry, "size");
     if (!cJSON_IsString(jsha))
         return false;
@@ -740,8 +739,7 @@ static void request_blob(profile_t *prof, bool from_machine) {
     dist_topic_for(prof, from_machine, prof->dist_topic, sizeof(prof->dist_topic));
     snprintf(prof->last_result, sizeof(prof->last_result), "%s", "pending");
     (void)mosquitto_subscribe(g_mosq, NULL, prof->dist_topic, 1);
-    logmsg("[%s] update needed (%s) -> subscribing %s", prof->name,
-           from_machine ? "per-machine" : "global", prof->dist_topic);
+    logmsg("[%s] update needed (%s) -> subscribing %s", prof->name, from_machine ? "per-machine" : "global", prof->dist_topic);
 }
 
 /* evaluate all profiles against the merged (global + per-machine) meta */
@@ -749,9 +747,9 @@ static void evaluate(void) {
     if (!g_meta_global && !g_meta_machine)
         return;
     for (int i = 0; i < g_cfg.nprofiles; i++) {
-        profile_t *p     = &g_cfg.profiles[i];
-        eff_t      eff   = effective_entry(p);
-        cJSON     *entry = eff.entry;
+        profile_t *p = &g_cfg.profiles[i];
+        eff_t eff = effective_entry(p);
+        cJSON *entry = eff.entry;
         if (!entry)
             continue; /* nothing advertised for this profile in either stream */
         cJSON *jver = cJSON_GetObjectItem(entry, "version");
@@ -768,13 +766,13 @@ static void evaluate(void) {
             continue; /* already fetching */
         /* signature gate: don't even fetch the blob unless the manufacturer signed
          * this entry, bound to the stream's topic + ts. */
-        cJSON      *jsha  = cJSON_GetObjectItem(entry, "sha");
-        cJSON      *jsize = cJSON_GetObjectItem(entry, "size");
-        cJSON      *jsig  = cJSON_GetObjectItem(entry, "sig");
-        const char *sha   = cJSON_IsString(jsha) ? jsha->valuestring : "";
-        long        size  = cJSON_IsNumber(jsize) ? (long)jsize->valuedouble : -1;
-        const char *sig   = cJSON_IsString(jsig) ? jsig->valuestring : NULL;
-        char        mtopic[160];
+        cJSON *jsha = cJSON_GetObjectItem(entry, "sha");
+        cJSON *jsize = cJSON_GetObjectItem(entry, "size");
+        cJSON *jsig = cJSON_GetObjectItem(entry, "sig");
+        const char *sha = cJSON_IsString(jsha) ? jsha->valuestring : "";
+        long size = cJSON_IsNumber(jsize) ? (long)jsize->valuedouble : -1;
+        const char *sig = cJSON_IsString(jsig) ? jsig->valuestring : NULL;
+        char mtopic[160];
         meta_topic_for(eff.from_machine, mtopic, sizeof(mtopic));
         if (!sig_ok(mtopic, p->name, sha, size, entry_ts(entry), sig)) {
             snprintf(p->last_result, sizeof(p->last_result), "%s", "fail");
@@ -796,7 +794,7 @@ static void handle_blob(profile_t *prof, const void *payload, int len) {
         (void)mosquitto_unsubscribe(g_mosq, NULL, prof->dist_topic);
 
     cJSON *entry = effective_entry(prof).entry;
-    cJSON *jsha  = entry ? cJSON_GetObjectItem(entry, "sha") : NULL;
+    cJSON *jsha = entry ? cJSON_GetObjectItem(entry, "sha") : NULL;
     cJSON *jcsha = entry ? cJSON_GetObjectItem(entry, "csha") : NULL;
 
     int rc = -1;
@@ -829,8 +827,8 @@ static void handle_blob(profile_t *prof, const void *payload, int len) {
     (void)unlink(tmpl);
     snprintf(prof->last_result, sizeof(prof->last_result), "%s", rc == 0 ? "ok" : "fail");
     if (rc != 0 && prof->on_fail == ONFAIL_RETRY) {
-        cJSON *jt   = entry ? cJSON_GetObjectItem(entry, "type") : NULL;
-        bool   urge = jt && cJSON_IsString(jt) && strcmp(jt->valuestring, "urgent") == 0;
+        cJSON *jt = entry ? cJSON_GetObjectItem(entry, "type") : NULL;
+        bool urge = jt && cJSON_IsString(jt) && strcmp(jt->valuestring, "urgent") == 0;
         prof->next_retry = time(NULL) + (urge ? g_cfg.retry_urgent : g_cfg.retry_normal);
     }
     g_report_due = true;
@@ -863,7 +861,7 @@ static void update_meta(cJSON **slot, const void *payload, int len, const char *
     }
     if (*slot)
         cJSON_Delete(*slot);
-    *slot        = parsed; /* NULL when cleared */
+    *slot = parsed; /* NULL when cleared */
     g_meta_dirty = true;
     logmsg("%s meta %s (%d bytes)", which, parsed ? "received" : "cleared", len);
 }
@@ -893,7 +891,10 @@ static void on_message(struct mosquitto *m, void *u, const struct mosquitto_mess
 
 /* ---- main --------------------------------------------------------------- */
 
-static void on_sig(int s) { (void)s; g_stop = 1; }
+static void on_sig(int s) {
+    (void)s;
+    g_stop = 1;
+}
 
 static int run_check(const char *cfgpath) {
     config_t c;
@@ -901,12 +902,9 @@ static int run_check(const char *cfgpath) {
         printf("CHECK FAILED: %s\n", cfgpath);
         return 1;
     }
-    printf("ok: %s — %d profile(s), signatures %s\n", cfgpath, c.nprofiles,
-           c.sign_enabled ? "ENFORCED (pubkey present)" : "off (no pubkey)");
+    printf("ok: %s — %d profile(s), signatures %s\n", cfgpath, c.nprofiles, c.sign_enabled ? "ENFORCED (pubkey present)" : "off (no pubkey)");
     for (int i = 0; i < c.nprofiles; i++)
-        printf("  - %s -> %s%s%s%s\n", c.profiles[i].name, c.profiles[i].file,
-               c.profiles[i].machine_specific ? " [machine-specific]" : "",
-               c.profiles[i].service[0] ? " [svc:" : "", c.profiles[i].service);
+        printf("  - %s -> %s%s%s%s\n", c.profiles[i].name, c.profiles[i].file, c.profiles[i].machine_specific ? " [machine-specific]" : "", c.profiles[i].service[0] ? " [svc:" : "", c.profiles[i].service);
     return 0;
 }
 
@@ -922,8 +920,7 @@ static int run_status(const char *cfgpath) {
     if (!g_cfg.macid[0])
         get_mac(g_cfg.macid, sizeof(g_cfg.macid)); /* derive unless config overrides */
     snprintf(g_meta_topic, sizeof(g_meta_topic), "%s/%s/meta", g_cfg.prefix, g_cfg.arch);
-    snprintf(g_meta_topic_machine, sizeof(g_meta_topic_machine), "%s/%s/meta/%s",
-             g_cfg.prefix, g_cfg.arch, g_cfg.macid);
+    snprintf(g_meta_topic_machine, sizeof(g_meta_topic_machine), "%s/%s/meta/%s", g_cfg.prefix, g_cfg.arch, g_cfg.macid);
     mosquitto_lib_init();
     char cid[96];
     snprintf(cid, sizeof(cid), "mqtt-deployer-status-%s", g_cfg.macid);
@@ -947,24 +944,22 @@ static int run_status(const char *cfgpath) {
         }
     bool have_meta = g_meta_global || g_meta_machine;
 
-    printf("deployer status — arch=%s prefix=%s mac=%s signatures=%s\n",
-           g_cfg.arch, g_cfg.prefix, g_cfg.macid, g_cfg.sign_enabled ? "ENFORCED" : "off");
-    printf("broker %s:%d — %s\n", g_cfg.broker, g_cfg.port,
-           have_meta ? "connected, meta received" : (connected ? "connected, no meta published" : "UNREACHABLE"));
+    printf("deployer status — arch=%s prefix=%s mac=%s signatures=%s\n", g_cfg.arch, g_cfg.prefix, g_cfg.macid, g_cfg.sign_enabled ? "ENFORCED" : "off");
+    printf("broker %s:%d — %s\n", g_cfg.broker, g_cfg.port, have_meta ? "connected, meta received" : (connected ? "connected, no meta published" : "UNREACHABLE"));
     printf("%-20s %-9s %-13s %-13s %-15s %-7s %-8s %s\n", "profile", "version", "installed", "advertised", "pushed", "src", "sig", "state");
     for (int i = 0; i < g_cfg.nprofiles; i++) {
-        profile_t *p       = &g_cfg.profiles[i];
-        char       isha[SHA_HEX];
-        bool       present = sha256_of(p->file, isha) == 0;
-        eff_t      eff     = effective_entry(p);
-        cJSON     *e       = eff.entry;
-        cJSON     *jv      = e ? cJSON_GetObjectItem(e, "version") : NULL;
-        cJSON     *js      = e ? cJSON_GetObjectItem(e, "sha") : NULL;
-        cJSON     *jsig    = e ? cJSON_GetObjectItem(e, "sig") : NULL;
-        cJSON     *jsz     = e ? cJSON_GetObjectItem(e, "size") : NULL;
-        const char *ver    = (jv && cJSON_IsString(jv)) ? jv->valuestring : "-";
+        profile_t *p = &g_cfg.profiles[i];
+        char isha[SHA_HEX];
+        bool present = sha256_of(p->file, isha) == 0;
+        eff_t eff = effective_entry(p);
+        cJSON *e = eff.entry;
+        cJSON *jv = e ? cJSON_GetObjectItem(e, "version") : NULL;
+        cJSON *js = e ? cJSON_GetObjectItem(e, "sha") : NULL;
+        cJSON *jsig = e ? cJSON_GetObjectItem(e, "sig") : NULL;
+        cJSON *jsz = e ? cJSON_GetObjectItem(e, "size") : NULL;
+        const char *ver = (jv && cJSON_IsString(jv)) ? jv->valuestring : "-";
         const char *advsha = (js && cJSON_IsString(js)) ? js->valuestring : NULL;
-        const char *src    = !e ? "-" : (eff.from_machine ? "machine" : "global");
+        const char *src = !e ? "-" : (eff.from_machine ? "machine" : "global");
 
         const char *sig;
         if (!g_cfg.sign_enabled)
@@ -982,8 +977,7 @@ static int run_status(const char *cfgpath) {
 
         const char *state;
         if (!e)
-            state = present ? (p->machine_specific ? "installed (await machine)" : "installed (not advertised)")
-                            : "absent, not advertised";
+            state = present ? (p->machine_specific ? "installed (await machine)" : "installed (not advertised)") : "absent, not advertised";
         else if (!present)
             state = "ABSENT (advertised)";
         else if (advsha && strcmp(isha, advsha) == 0)
@@ -995,10 +989,10 @@ static int run_status(const char *cfgpath) {
         if (p->service[0])
             snprintf(svcbuf, sizeof(svcbuf), " [%s:%s]", p->service, svc_active(p->service) ? "active" : "inactive");
 
-        char   ib[13], ab[13], tsbuf[20];
+        char ib[13], ab[13], tsbuf[20];
         double ts = e ? entry_ts(e) : 0;
         if (ts > 0) {
-            time_t    t = (time_t)ts;
+            time_t t = (time_t)ts;
             struct tm tm;
             localtime_r(&t, &tm);
             strftime(tsbuf, sizeof(tsbuf), "%m-%d %H:%M:%S", &tm);
@@ -1019,8 +1013,8 @@ static void usage(const char *a0) {
 }
 
 int main(int argc, char **argv) {
-    const char *cfgpath     = NULL;
-    bool        want_status = false;
+    const char *cfgpath = NULL;
+    bool want_status = false;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
@@ -1054,8 +1048,7 @@ int main(int argc, char **argv) {
     if (!g_cfg.macid[0])
         get_mac(g_cfg.macid, sizeof(g_cfg.macid)); /* derive unless config overrides */
     snprintf(g_meta_topic, sizeof(g_meta_topic), "%s/%s/meta", g_cfg.prefix, g_cfg.arch);
-    snprintf(g_meta_topic_machine, sizeof(g_meta_topic_machine), "%s/%s/meta/%s",
-             g_cfg.prefix, g_cfg.arch, g_cfg.macid);
+    snprintf(g_meta_topic_machine, sizeof(g_meta_topic_machine), "%s/%s/meta/%s", g_cfg.prefix, g_cfg.arch, g_cfg.macid);
 
     mosquitto_lib_init();
     char cid[96];
@@ -1078,8 +1071,7 @@ int main(int argc, char **argv) {
     mosquitto_message_callback_set(g_mosq, on_message);
     mosquitto_reconnect_delay_set(g_mosq, 2, 30, true);
 
-    logmsg("starting: broker %s:%d arch=%s prefix=%s profiles=%d",
-           g_cfg.broker, g_cfg.port, g_cfg.arch, g_cfg.prefix, g_cfg.nprofiles);
+    logmsg("starting: broker %s:%d arch=%s prefix=%s profiles=%d", g_cfg.broker, g_cfg.port, g_cfg.arch, g_cfg.prefix, g_cfg.nprofiles);
     if (mosquitto_connect(g_mosq, g_cfg.broker, g_cfg.port, 60) != MOSQ_ERR_SUCCESS)
         logmsg("initial connect failed; will retry");
 
@@ -1087,7 +1079,7 @@ int main(int argc, char **argv) {
     while (!g_stop) {
         int rc = mosquitto_loop(g_mosq, 1000, 1);
         if (rc != MOSQ_ERR_SUCCESS) {
-            struct timespec ts = {2, 0};
+            struct timespec ts = { 2, 0 };
             (void)nanosleep(&ts, NULL);
             (void)mosquitto_reconnect(g_mosq);
             continue;
@@ -1102,7 +1094,7 @@ int main(int argc, char **argv) {
             profile_t *p = &g_cfg.profiles[i];
             if (p->next_retry && now >= p->next_retry) {
                 p->next_retry = 0;
-                eff_t eff     = effective_entry(p);
+                eff_t eff = effective_entry(p);
                 if (eff.entry && !up_to_date(p, eff.entry))
                     request_blob(p, eff.from_machine);
             }
@@ -1111,7 +1103,7 @@ int main(int argc, char **argv) {
             /* report once meta has been seen (or after a short grace at startup) */
             if (g_meta_global || g_meta_machine || reported_startup) {
                 report_inventory();
-                g_report_due     = false;
+                g_report_due = false;
                 reported_startup = true;
             } else if (!reported_startup) {
                 static int grace = 0;
@@ -1129,7 +1121,7 @@ int main(int argc, char **argv) {
             if (p->pending_restart) {
                 p->pending_restart = false;
                 logmsg("[%s] restarting %s to apply", p->name, p->service);
-                char *const ra[] = {"systemctl", "--no-block", "restart", (char *)p->service, NULL};
+                char *const ra[] = { "systemctl", "--no-block", "restart", (char *)p->service, NULL };
                 (void)run_cmd(ra);
             }
         }
