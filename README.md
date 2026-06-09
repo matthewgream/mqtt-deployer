@@ -19,6 +19,41 @@ master (CI/dev box)                  broker (retained)               device
   watch fleet  <--sub--              <status-topic> (per device) <--   report inventory
 ```
 
+## Architecture
+
+A small set of principles, not a framework:
+
+- **One master, many clients.** The master (a dev box / CI) publishes; devices
+  pull. The master holds no device state, opens no connections to devices, and
+  doesn't track who is online — it just leaves signed, retained artifacts on the
+  broker. Devices converge when ready; an offline box catches up on reconnect.
+
+- **It's just MQTT.** No bespoke transport, so you inherit the whole ecosystem for
+  free: TLS, password/cert auth, broker **bridging** (fan a fleet across sites),
+  retained messages as the distribution *and* state store, QoS, last-will. The
+  broker's retained tree **is** the deployment database — no other server, queue,
+  or orchestrator exists.
+
+- **Master simplicity, client choice.** The master's job is tiny: publish an
+  artifact (one method today, several later) as a signed retained message. Each
+  client then decides — subject to the methods on offer — *how, when, and in what
+  way* to pull, verify, seat, restart, and clean up. Policy (staging, pacing,
+  retry, rollback) lives on the device, not in a central controller.
+
+- **Global + per-machine addressing.** Two retained streams — fleet-wide and
+  per-`<macid>` — merge on the device, so you deploy to everyone OR pin one box (a
+  per-machine config, a one-off binary fix for a single device) with no global push
+  ever clobbering it; a newer global later supersedes the pin.
+
+- **Content-addressed.** A `sha` is the identity. Rollback is just deploying the old
+  bytes again; re-publishing an unchanged artifact is a no-op. No version database,
+  no local state to corrupt.
+
+- **Security baked in.** Ed25519 signatures bind each entry to its **content, its
+  topic, and its version (`ts`)** — so an artifact can't be replayed onto another
+  machine or into global (cross-play), nor have its precedence forged, whether by
+  accident or attack. A device holding the public key fails closed.
+
 ## Topics
 
 | topic | retained | meaning |
@@ -213,10 +248,47 @@ addressing makes an older artifact just another forward deploy:
 ./mqtt-deploy-publish armv6 myapp /path/to/previous-myapp.armhf file urgent <oldver>
 ```
 
+## Status
+
+Working today — `method=file` (whole blob in one retained message; fine for
+binaries, configs, and scripts):
+
+- content-addressed delivery (`sha`), crash-safe seating, content-addressed
+  rollback (re-publish old bytes; first-deploy failure falls back to the baked copy)
+- two retained streams — global + per-`<macid>` — merged with **ts-precedence**
+  and **`machine-specific`** profiles
+- **Ed25519** signatures bound to topic + ts, fail-closed when `pubkey` is set
+- **revocation** (`mqtt-deploy-revoke`, `--revoke`) — the re-image / retire-a-pin lever
+- per-profile `--status`, config `--check`, retained inventory upstream
+- proven on a real ARMv6 fleet device (master + client are dogfooded)
+
 ## Roadmap
 
-**method=file** (whole blob in one retained message — fine for binaries/configs/
-scripts) with content-addressing, two-stream per-machine targeting, ts-precedence,
-and Ed25519 signatures. Planned: **chunked/byte-range** methods for large images
-(memory-constrained + duty-cycled devices pull at their own pace); mosquitto
-**ACLs** so only the publisher can write firmware; richer presence + heartbeat.
+- **Chunked / byte-range delivery.** Beyond `method=file` (one retained blob), add
+  chunked and byte-range delivery as published *methods*, so large images stream in
+  pieces. Needs a master-side helper to slice and track byte deployments, and
+  clients that reassemble at their own pace — the method is negotiated, the device
+  chooses how to consume it.
+
+- **Master-side tooling.** Diagnostic / status / inventory tools to see and manage
+  the whole deployment landscape *from the master* — what's published, what each
+  device reports, what's pinned per-machine, what's stale — beyond the per-device
+  `--status`.
+
+- **Client-side staging + pacing.** First-class staging and rollout pacing on the
+  device (canary, soak, scheduled windows). This is **orthogonal to the delivery
+  method** — the client already owns *when* and *how*; this formalises it.
+
+- **Large-file retention.** Server-side support for artifacts too big to sit in a
+  broker's in-memory retained store: **non-memory-resident retention** (a
+  disk-backed retained broker, or a file + responder) so image size isn't bounded
+  by broker RAM.
+
+- **Library extraction (portability).** The client is one Linux app today; factor
+  the core mechanisms — manifest merge, verify, seat, signature check — into
+  libraries so the same protocol + trust model runs on constrained targets like
+  **ESP32**, with different I/O underneath.
+
+- Smaller items: lighter per-arch **compression** (xz is heavy for tiny MCUs);
+  mosquitto **ACLs** (only the publisher writes the namespace; a device reads only
+  its own `…/meta/<macid>`); richer **presence / heartbeat** beyond retained inventory.
