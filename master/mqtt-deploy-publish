@@ -2,26 +2,47 @@
 # mqtt-deploy-publish — publish an artifact to the fleet firmware namespace so
 # devices running mqtt-deployer pick it up.
 #
-#   mqtt-deploy-publish <arch> <profile> <file> [method] [normal|urgent] [version]
+#   mqtt-deploy-publish [--macid <hex>] [--revoke] <arch> <profile> <file> \
+#                       [method] [normal|urgent] [version]
 #
 # Publishes (retained, to the master broker on localhost):
-#   <prefix>/<arch>/dist/<profile>   the xz-compressed file blob   (FIRST)
-#   <prefix>/<arch>/meta             the suite manifest (merged)   (THEN — the commit)
+#   global:       <prefix>/<arch>/dist/<profile>         blob      (FIRST)
+#                 <prefix>/<arch>/meta                    manifest  (THEN — commit)
+#   per-machine:  <prefix>/<arch>/dist/<profile>/<macid>  blob
+#   (--macid)     <prefix>/<arch>/meta/<macid>            manifest
 #
-# Signing: if a signing key exists (KEY, default ./iotdata-deploy-sign.key, made
-# by mqtt-deploy-keygen) each meta entry gets an Ed25519 `sig` over the canonical
-# "<arch>\n<profile>\n<sha>\n<size>\n". Devices configured with the matching
-# `pubkey` reject anything unsigned or mis-signed. No key => no sig (legacy).
+# Each meta entry carries `ts` (epoch seconds) — a superincreasing version the
+# client uses for precedence (higher wins; per-machine wins ties), doubling as a
+# stamp you can line up against pushes and journald.
 #
-# Env: PREFIX (default iotdata/firmware), HOST (default localhost), PORT (1883),
+# Signing: with a key (KEY, default ./iotdata-deploy-sign.key) each entry gets an
+# Ed25519 `sig` over "<meta-topic>\n<profile>\n<sha>\n<size>\n<ts>". Binding the
+# topic stops a per-machine artifact being replayed onto another machine/global;
+# binding ts stops precedence tampering. No key => unsigned (legacy).
+#
+# --revoke (global push only): after the global entry is published, clear every
+# per-machine override OF THIS PROFILE, so the global becomes authoritative+tidy.
+#
+# Env: PREFIX (default iotdata/firmware), HOST (localhost), PORT (1883),
 #      KEY (default <scriptdir>/iotdata-deploy-sign.key).
 set -eu
 
-[ $# -ge 3 ] || { echo "usage: $0 <arch> <profile> <file> [method] [normal|urgent] [version]" >&2; exit 2; }
-ARCH=$1; PROFILE=$2; FILE=$3
-METHOD=${4:-file}
-TYPE=${5:-normal}
-VERSION=${6:-$(date -u +%Y%m%dT%H%M%SZ)}
+MACID=""; REVOKE=0; np=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --macid) MACID=${2:-}; shift 2 ;;
+        --macid=*) MACID=${1#--macid=}; shift ;;
+        --revoke) REVOKE=1; shift ;;
+        --) shift; while [ $# -gt 0 ]; do np=$((np + 1)); eval "p$np=\$1"; shift; done ;;
+        --*) echo "unknown option: $1" >&2; exit 2 ;;
+        *) np=$((np + 1)); eval "p$np=\$1"; shift ;;
+    esac
+done
+[ "$np" -ge 3 ] || { echo "usage: $0 [--macid <hex>] [--revoke] <arch> <profile> <file> [method] [normal|urgent] [version]" >&2; exit 2; }
+ARCH=$p1; PROFILE=$p2; FILE=$p3
+METHOD=${p4:-file}
+TYPE=${p5:-normal}
+VERSION=${p6:-$(date -u +%Y%m%dT%H%M%SZ)}
 PREFIX=${PREFIX:-iotdata/firmware}
 HOST=${HOST:-localhost}
 PORT=${PORT:-1883}
@@ -29,11 +50,27 @@ SCRIPTDIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 KEY=${KEY:-"$SCRIPTDIR/iotdata-deploy-sign.key"}
 
 [ -f "$FILE" ] || { echo "no such file: $FILE" >&2; exit 1; }
-case "$PROFILE" in *[!A-Za-z0-9_.-]*) echo "profile must be [A-Za-z0-9_.-]" >&2; exit 2;; esac
-case "$METHOD" in file) ;; *) echo "only method 'file' supported for now" >&2; exit 2;; esac
-case "$TYPE" in normal|urgent) ;; *) echo "type must be normal|urgent" >&2; exit 2;; esac
+case "$PROFILE" in *[!A-Za-z0-9_.-]*) echo "profile must be [A-Za-z0-9_.-]" >&2; exit 2 ;; esac
+case "$METHOD" in file) ;; *) echo "only method 'file' supported for now" >&2; exit 2 ;; esac
+case "$TYPE" in normal | urgent) ;; *) echo "type must be normal|urgent" >&2; exit 2 ;; esac
+if [ -n "$MACID" ]; then
+    case "$MACID" in *[!a-f0-9]* | "") echo "macid must be lowercase hex" >&2; exit 2 ;; esac
+fi
+[ "$REVOKE" = 1 ] && [ -n "$MACID" ] && { echo "--revoke is for global pushes (drop --macid)" >&2; exit 2; }
+
+# topic layout: per-machine if --macid, else global
+if [ -n "$MACID" ]; then
+    meta_topic="$PREFIX/$ARCH/meta/$MACID"
+    dist_topic="$PREFIX/$ARCH/dist/$PROFILE/$MACID"
+    scope="machine=$MACID"
+else
+    meta_topic="$PREFIX/$ARCH/meta"
+    dist_topic="$PREFIX/$ARCH/dist/$PROFILE"
+    scope="global"
+fi
 
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+TS=$(date +%s)
 
 usha=$(sha256sum "$FILE" | cut -d' ' -f1)
 usize=$(stat -c%s "$FILE")
@@ -41,33 +78,65 @@ xz -9 -e -c "$FILE" > "$tmp/blob.xz"
 csha=$(sha256sum "$tmp/blob.xz" | cut -d' ' -f1)
 csize=$(stat -c%s "$tmp/blob.xz")
 
-# sign the canonical meta entry (arch\nprofile\nsha\nsize\n) if a key is present
+# sign "<meta-topic>\n<profile>\n<sha>\n<size>\n<ts>\n" (one-shot ed25519 wants a file)
 SIG=""
 if [ -f "$KEY" ]; then
-    # ed25519 is one-shot: pkeyutl -rawin needs a real file, not a pipe.
-    printf '%s\n%s\n%s\n%s\n' "$ARCH" "$PROFILE" "$usha" "$usize" > "$tmp/payload"
+    printf '%s\n%s\n%s\n%s\n%s\n' "$meta_topic" "$PROFILE" "$usha" "$usize" "$TS" > "$tmp/payload"
     SIG=$(openssl pkeyutl -sign -inkey "$KEY" -rawin -in "$tmp/payload" | base64 -w0)
 fi
 
-echo "deploy: $PREFIX/$ARCH  profile=$PROFILE  version=$VERSION  type=$TYPE"
+echo "deploy: $PREFIX/$ARCH  profile=$PROFILE  scope=$scope  version=$VERSION  type=$TYPE  ts=$TS"
 echo "  uncompressed $usize B  sha=$usha"
 echo "  compressed   $csize B  sha=$csha"
-echo "  signed:      $([ -n "$SIG" ] && echo "yes (ed25519)" || echo "NO — unsigned (no $KEY)")"
+echo "  signed:      $([ -n "$SIG" ] && echo "yes (ed25519, topic+ts bound)" || echo "NO — unsigned (no $KEY)")"
 
 # 1) blob first (retained) so it's in place before meta points at it
-mosquitto_pub -h "$HOST" -p "$PORT" -q 1 -r -t "$PREFIX/$ARCH/dist/$PROFILE" -f "$tmp/blob.xz"
-echo "  published blob -> $PREFIX/$ARCH/dist/$PROFILE"
+mosquitto_pub -h "$HOST" -p "$PORT" -q 1 -r -t "$dist_topic" -f "$tmp/blob.xz"
+echo "  published blob -> $dist_topic"
 
-# 2) merge this entry into the retained meta and republish (the commit)
-meta_topic="$PREFIX/$ARCH/meta"
-cur=$(mosquitto_sub -h "$HOST" -p "$PORT" -t "$meta_topic" -C 1 -W 2 2>/dev/null || true)
+# 2) merge this entry into the scope's retained meta manifest and republish (commit).
+# Read with retries: a flaky/empty read must NEVER clobber the existing manifest
+# (an intermittent miss here once wiped 7 of 8 profiles). Take the first non-empty
+# result; only after several consistent empties do we treat it as genuinely new.
+cur=""
+i=0
+while [ "$i" -lt 5 ]; do
+    cur=$(mosquitto_sub -h "$HOST" -p "$PORT" -t "$meta_topic" -C 1 -W 2 2>/dev/null || true)
+    [ -n "$cur" ] && break
+    i=$((i + 1)); sleep 0.3
+done
 [ -n "${cur:-}" ] || cur='{}'
+# guard: must be a JSON object, else abort rather than overwrite with garbage
+printf '%s' "$cur" | jq -e 'type == "object"' >/dev/null 2>&1 || {
+    echo "ERROR: meta read returned non-object ('$cur'); aborting to avoid clobber" >&2; exit 1; }
 entry=$(jq -nc --arg v "$VERSION" --argjson us "$usize" --arg u "$usha" \
               --arg c "$csha" --argjson cs "$csize" --arg m "$METHOD" --arg t "$TYPE" \
-              --arg sig "$SIG" \
-        '{version:$v,size:$us,sha:$u,csha:$c,csize:$cs,method:$m,type:$t}
+              --argjson ts "$TS" --arg sig "$SIG" \
+        '{version:$v,size:$us,sha:$u,csha:$c,csize:$cs,method:$m,type:$t,ts:$ts}
          + (if $sig == "" then {} else {sig:$sig} end)')
 new=$(printf '%s' "$cur" | jq -c --arg p "$PROFILE" --argjson e "$entry" '. + {($p):$e}')
 mosquitto_pub -h "$HOST" -p "$PORT" -q 1 -r -t "$meta_topic" -m "$new"
 echo "  published meta -> $meta_topic"
+
+# 3) optional: retire per-machine overrides of this profile (global push only).
+# Capture the per-machine meta topics FIRST — clearing republishes a zero-length
+# retained msg, which a live subscription would feed back into the loop.
+if [ "$REVOKE" = 1 ]; then
+    echo "  --revoke: clearing per-machine overrides of '$PROFILE'"
+    metas=$(mosquitto_sub -h "$HOST" -p "$PORT" -t "$PREFIX/$ARCH/meta/+" -F '%t' -W 2 2>/dev/null | sort -u)
+    for mt in $metas; do
+        payload=$(mosquitto_sub -h "$HOST" -p "$PORT" -t "$mt" -C 1 -W 2 2>/dev/null || true)
+        [ -n "$payload" ] || continue
+        printf '%s' "$payload" | jq -e --arg p "$PROFILE" 'has($p)' >/dev/null 2>&1 || continue
+        macid=${mt##*/}
+        stripped=$(printf '%s' "$payload" | jq -c --arg p "$PROFILE" 'del(.[$p])')
+        if [ "$stripped" = '{}' ]; then
+            mosquitto_pub -h "$HOST" -p "$PORT" -r -n -t "$mt"
+        else
+            mosquitto_pub -h "$HOST" -p "$PORT" -q 1 -r -t "$mt" -m "$stripped"
+        fi
+        mosquitto_pub -h "$HOST" -p "$PORT" -r -n -t "$PREFIX/$ARCH/dist/$PROFILE/$macid"
+        echo "    retired $macid"
+    done
+fi
 echo "done."

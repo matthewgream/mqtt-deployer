@@ -17,11 +17,19 @@
  * again" (content-addressing makes that a normal forward deploy). After every
  * evaluation the device reports its installed inventory (retained) upstream.
  *
+ * Two retained meta streams are merged: the global "<prefix>/<arch>/meta" and a
+ * per-machine "<prefix>/<arch>/meta/<macid>". A profile marked machine-specific
+ * is taken ONLY from the per-machine stream (global ignored); otherwise the entry
+ * with the higher `ts` wins (tie -> per-machine), so a per-machine push pins one
+ * box and a newer global push retires it. Blobs live at "<prefix>/<arch>/dist/
+ * <profile>" (global) or "<prefix>/<arch>/dist/<profile>/<macid>" (per-machine).
+ *
  * Integrity is content-addressed (sha). Authenticity is optional: set `pubkey`
  * in the config (the manufacturer's ed25519 public key, inline base64) and every
- * meta entry must carry a valid `sig` over "<arch>\n<profile>\n<sha>\n<size>" or
- * it is rejected before the blob is even fetched. method=file (whole blob in one
- * retained message). Generic — iotdata is just one config.
+ * meta entry must carry a valid `sig` over "<meta-topic>\n<profile>\n<sha>\n
+ * <size>\n<ts>" — binding the topic stops a per-machine artifact landing on
+ * another box, binding ts stops precedence tampering — or it is rejected before
+ * the blob is fetched. method=file. Generic — iotdata is just one config.
  * --------------------------------------------------------------------------------------------------------------------------------------- */
 #define _GNU_SOURCE
 #include <cjson/cJSON.h>
@@ -56,12 +64,14 @@ typedef struct {
     char     verify[PATH_MAX_]; /* command; %candidate% substituted; empty = none */
     onfail_t on_fail;
     bool     retain_bak;
-    bool     live_replace;     /* file swappable while service runs (config, or self) */
-    mode_t   mode;             /* permissions for the seated file (default 0644) */
+    bool     live_replace;      /* file swappable while service runs (config, or self) */
+    bool     machine_specific;  /* only honour the per-<macid> entry; ignore global */
+    mode_t   mode;              /* permissions for the seated file (default 0644) */
     /* runtime state */
     char   installed_sha[SHA_HEX]; /* sha of the seated file (cache) */
     char   version[64];            /* last applied version from meta */
     char   last_result[16];        /* "ok" | "fail" | "pending" | "none" */
+    char   dist_topic[256];        /* blob topic currently being fetched (match on receipt) */
     time_t next_retry;             /* 0 = none */
     bool   pending_restart;        /* live-replace: restart deferred until after report */
 } profile_t;
@@ -82,6 +92,7 @@ typedef struct {
     int        jitter;
     bool          sign_enabled;  /* a pubkey was configured => signatures enforced */
     unsigned char sign_pub[32];  /* raw ed25519 public key */
+    char       macid[32];        /* this device's mac (hex), for the per-machine stream */
     profile_t  profiles[MAX_PROFILES];
     int        nprofiles;
 } config_t;
@@ -89,9 +100,11 @@ typedef struct {
 static config_t      g_cfg;
 static struct mosquitto *g_mosq;
 static volatile sig_atomic_t g_stop;
-static char          g_meta_topic[128];
-static cJSON        *g_meta;       /* latest parsed meta (owned) */
-static bool          g_meta_dirty; /* set on new meta, cleared after evaluate */
+static char          g_meta_topic[160];         /* global  <prefix>/<arch>/meta */
+static char          g_meta_topic_machine[160]; /* machine <prefix>/<arch>/meta/<macid> */
+static cJSON        *g_meta_global;  /* latest parsed global meta (owned, NULL if cleared) */
+static cJSON        *g_meta_machine; /* latest parsed per-machine meta (owned, NULL if cleared) */
+static bool          g_meta_dirty;   /* set on new/cleared meta, cleared after evaluate */
 static bool          g_report_due;
 
 static void logmsg(const char *fmt, ...) {
@@ -290,12 +303,14 @@ static int b64decode(const char *in, unsigned char *out, int outsz) {
 }
 
 /* Verify the manufacturer's ed25519 signature over the canonical meta entry
- * "<arch>\n<profile>\n<sha>\n<size>\n". Returns true when signing is NOT
- * enforced (no pubkey configured), or when the signature is present and valid;
- * false (fail-closed) when enforced and the signature is missing/bad. The bytes
- * are bound by <sha>, so a valid signature authorises exactly those bytes — the
- * blob's own sha is checked separately after download. */
-static bool sig_ok(const char *profile, const char *sha, long size, const char *sig_b64) {
+ * "<meta-topic>\n<profile>\n<sha>\n<size>\n<ts>\n". Returns true when signing is
+ * NOT enforced (no pubkey configured), or when the signature is present and
+ * valid; false (fail-closed) when enforced and the signature is missing/bad. The
+ * meta-topic binds the entry to its stream (global vs this machine), ts binds the
+ * precedence version, and <sha> binds the bytes — the blob's own sha is checked
+ * separately after download. */
+static bool sig_ok(const char *meta_topic, const char *profile, const char *sha, long size, double ts,
+                   const char *sig_b64) {
     if (!g_cfg.sign_enabled)
         return true;
     if (!sig_b64 || !*sig_b64) {
@@ -308,8 +323,9 @@ static bool sig_ok(const char *profile, const char *sha, long size, const char *
         logmsg("[%s] malformed signature -> reject", profile);
         return false;
     }
-    char payload[300];
-    int  plen = snprintf(payload, sizeof(payload), "%s\n%s\n%s\n%ld\n", g_cfg.arch, profile, sha, size);
+    char payload[400];
+    int  plen = snprintf(payload, sizeof(payload), "%s\n%s\n%s\n%ld\n%lld\n",
+                         meta_topic, profile, sha, size, (long long)ts);
     if (plen <= 0 || plen >= (int)sizeof(payload))
         return false;
     EVP_PKEY   *pk  = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, NULL, g_cfg.sign_pub, 32);
@@ -436,6 +452,8 @@ static int config_load(config_t *c, const char *path, bool verbose) {
                 snprintf(c->status_topic, sizeof(c->status_topic), "%s", val);
             else if (strcmp(key, "client-id") == 0)
                 snprintf(c->client_id, sizeof(c->client_id), "%s", val);
+            else if (strcmp(key, "macid") == 0)
+                snprintf(c->macid, sizeof(c->macid), "%s", val); /* override the derived mac */
             else if (strcmp(key, "retry-normal") == 0)
                 c->retry_normal = atoi(val);
             else if (strcmp(key, "retry-urgent") == 0)
@@ -469,6 +487,8 @@ static int config_load(config_t *c, const char *path, bool verbose) {
                 prof->retain_bak = parse_bool(val);
             else if (strcmp(key, "live-replace") == 0)
                 prof->live_replace = parse_bool(val);
+            else if (strcmp(key, "machine-specific") == 0)
+                prof->machine_specific = parse_bool(val);
             else if (strcmp(key, "mode") == 0)
                 prof->mode = (mode_t)strtol(val, NULL, 8);
             else if (verbose)
@@ -650,11 +670,53 @@ static void report_inventory(void) {
 
 /* ---- profile evaluation + fetch ----------------------------------------- */
 
-static profile_t *find_profile(const char *name) {
-    for (int i = 0; i < g_cfg.nprofiles; i++)
-        if (strcmp(g_cfg.profiles[i].name, name) == 0)
-            return &g_cfg.profiles[i];
-    return NULL;
+/* the chosen meta entry for a profile, and which stream it came from */
+typedef struct {
+    cJSON *entry;
+    bool   from_machine;
+} eff_t;
+
+static double entry_ts(cJSON *e) {
+    cJSON *t = e ? cJSON_GetObjectItem(e, "ts") : NULL;
+    return (t && cJSON_IsNumber(t)) ? t->valuedouble : 0;
+}
+
+/* merge the two streams per the precedence rule:
+ *   machine-specific profile -> per-machine entry only (global ignored)
+ *   otherwise                -> higher ts wins, tie -> per-machine */
+static eff_t effective_entry(const profile_t *prof) {
+    cJSON *g = g_meta_global ? cJSON_GetObjectItem(g_meta_global, prof->name) : NULL;
+    cJSON *m = g_meta_machine ? cJSON_GetObjectItem(g_meta_machine, prof->name) : NULL;
+    eff_t  r;
+    if (prof->machine_specific) {
+        r.entry = m;
+        r.from_machine = true;
+    } else if (m && (!g || entry_ts(m) >= entry_ts(g))) {
+        r.entry = m;
+        r.from_machine = true;
+    } else {
+        r.entry = g;
+        r.from_machine = false;
+    }
+    return r;
+}
+
+/* blob topic for a profile: global <prefix>/<arch>/dist/<profile>, or per-machine
+ * <prefix>/<arch>/dist/<profile>/<macid> (profile-first, so a profile's blobs are
+ * one subtree the revoke tool can clear wholesale) */
+static void dist_topic_for(const profile_t *prof, bool from_machine, char *out, size_t outsz) {
+    if (from_machine)
+        snprintf(out, outsz, "%s/%s/dist/%s/%s", g_cfg.prefix, g_cfg.arch, prof->name, g_cfg.macid);
+    else
+        snprintf(out, outsz, "%s/%s/dist/%s", g_cfg.prefix, g_cfg.arch, prof->name);
+}
+
+/* the meta topic an entry rode on — what its signature is bound to */
+static void meta_topic_for(bool from_machine, char *out, size_t outsz) {
+    if (from_machine)
+        snprintf(out, outsz, "%s/%s/meta/%s", g_cfg.prefix, g_cfg.arch, g_cfg.macid);
+    else
+        snprintf(out, outsz, "%s/%s/meta", g_cfg.prefix, g_cfg.arch);
 }
 
 /* does the installed file already match the meta entry's sha/size? */
@@ -672,24 +734,26 @@ static bool up_to_date(profile_t *prof, cJSON *entry) {
     return strcmp(have, jsha->valuestring) == 0;
 }
 
-/* subscribe to a profile's dist topic to pull the retained blob */
-static void request_blob(profile_t *prof) {
-    char topic[256];
-    snprintf(topic, sizeof(topic), "%s/%s/dist/%s", g_cfg.prefix, g_cfg.arch, prof->name);
+/* subscribe to a profile's dist topic to pull the retained blob (the chosen
+ * stream's topic is remembered so the blob can be matched on receipt) */
+static void request_blob(profile_t *prof, bool from_machine) {
+    dist_topic_for(prof, from_machine, prof->dist_topic, sizeof(prof->dist_topic));
     snprintf(prof->last_result, sizeof(prof->last_result), "%s", "pending");
-    (void)mosquitto_subscribe(g_mosq, NULL, topic, 1);
-    logmsg("[%s] update needed -> subscribing %s", prof->name, topic);
+    (void)mosquitto_subscribe(g_mosq, NULL, prof->dist_topic, 1);
+    logmsg("[%s] update needed (%s) -> subscribing %s", prof->name,
+           from_machine ? "per-machine" : "global", prof->dist_topic);
 }
 
-/* evaluate all profiles against the current meta */
-static void evaluate_meta(void) {
-    if (!g_meta)
+/* evaluate all profiles against the merged (global + per-machine) meta */
+static void evaluate(void) {
+    if (!g_meta_global && !g_meta_machine)
         return;
     for (int i = 0; i < g_cfg.nprofiles; i++) {
         profile_t *p     = &g_cfg.profiles[i];
-        cJSON     *entry = cJSON_GetObjectItem(g_meta, p->name);
+        eff_t      eff   = effective_entry(p);
+        cJSON     *entry = eff.entry;
         if (!entry)
-            continue; /* nothing advertised for this profile */
+            continue; /* nothing advertised for this profile in either stream */
         cJSON *jver = cJSON_GetObjectItem(entry, "version");
         if (cJSON_IsString(jver))
             snprintf(p->version, sizeof(p->version), "%s", jver->valuestring);
@@ -702,20 +766,21 @@ static void evaluate_meta(void) {
         }
         if (strcmp(p->last_result, "pending") == 0)
             continue; /* already fetching */
-        /* signature gate: don't even fetch the blob unless the manufacturer
-         * signed this (arch, profile, sha, size). The downloaded bytes are then
-         * bound to <sha> by the post-download check in handle_blob(). */
+        /* signature gate: don't even fetch the blob unless the manufacturer signed
+         * this entry, bound to the stream's topic + ts. */
         cJSON      *jsha  = cJSON_GetObjectItem(entry, "sha");
         cJSON      *jsize = cJSON_GetObjectItem(entry, "size");
         cJSON      *jsig  = cJSON_GetObjectItem(entry, "sig");
         const char *sha   = cJSON_IsString(jsha) ? jsha->valuestring : "";
         long        size  = cJSON_IsNumber(jsize) ? (long)jsize->valuedouble : -1;
         const char *sig   = cJSON_IsString(jsig) ? jsig->valuestring : NULL;
-        if (!sig_ok(p->name, sha, size, sig)) {
+        char        mtopic[160];
+        meta_topic_for(eff.from_machine, mtopic, sizeof(mtopic));
+        if (!sig_ok(mtopic, p->name, sha, size, entry_ts(entry), sig)) {
             snprintf(p->last_result, sizeof(p->last_result), "%s", "fail");
             continue;
         }
-        request_blob(p);
+        request_blob(p, eff.from_machine);
     }
     g_report_due = true;
 }
@@ -726,12 +791,11 @@ static void handle_blob(profile_t *prof, const void *payload, int len) {
     snprintf(tmpl, sizeof(tmpl), "%s.dl", prof->file);  /* uncompressed candidate */
     snprintf(tmpx, sizeof(tmpx), "%s.dlx", prof->file); /* compressed download */
 
-    /* unsubscribe so we don't reprocess */
-    char topic[256];
-    snprintf(topic, sizeof(topic), "%s/%s/dist/%s", g_cfg.prefix, g_cfg.arch, prof->name);
-    (void)mosquitto_unsubscribe(g_mosq, NULL, topic);
+    /* unsubscribe the exact dist topic we fetched from, so we don't reprocess */
+    if (prof->dist_topic[0])
+        (void)mosquitto_unsubscribe(g_mosq, NULL, prof->dist_topic);
 
-    cJSON *entry = g_meta ? cJSON_GetObjectItem(g_meta, prof->name) : NULL;
+    cJSON *entry = effective_entry(prof).entry;
     cJSON *jsha  = entry ? cJSON_GetObjectItem(entry, "sha") : NULL;
     cJSON *jcsha = entry ? cJSON_GetObjectItem(entry, "csha") : NULL;
 
@@ -782,31 +846,47 @@ static void on_connect(struct mosquitto *m, void *u, int rc) {
     }
     logmsg("connected to %s:%d", g_cfg.broker, g_cfg.port);
     (void)mosquitto_subscribe(m, NULL, g_meta_topic, 1);
+    if (g_meta_topic_machine[0])
+        (void)mosquitto_subscribe(m, NULL, g_meta_topic_machine, 1);
+}
+
+/* replace a meta slot from a retained payload; an empty payload is a cleared
+ * (revoked) topic -> slot becomes NULL. Re-evaluates either way. */
+static void update_meta(cJSON **slot, const void *payload, int len, const char *which) {
+    cJSON *parsed = NULL;
+    if (len > 0) {
+        parsed = cJSON_ParseWithLength(payload, (size_t)len);
+        if (!parsed) {
+            logmsg("%s meta parse failed (%d bytes) -> ignored", which, len);
+            return;
+        }
+    }
+    if (*slot)
+        cJSON_Delete(*slot);
+    *slot        = parsed; /* NULL when cleared */
+    g_meta_dirty = true;
+    logmsg("%s meta %s (%d bytes)", which, parsed ? "received" : "cleared", len);
 }
 
 static void on_message(struct mosquitto *m, void *u, const struct mosquitto_message *msg) {
     (void)m;
     (void)u;
     if (strcmp(msg->topic, g_meta_topic) == 0) {
-        cJSON *parsed = cJSON_ParseWithLength(msg->payload, (size_t)msg->payloadlen);
-        if (!parsed) {
-            logmsg("meta parse failed");
-            return;
-        }
-        if (g_meta)
-            cJSON_Delete(g_meta);
-        g_meta       = parsed;
-        g_meta_dirty = true;
-        logmsg("meta received (%d bytes)", msg->payloadlen);
+        update_meta(&g_meta_global, msg->payload, msg->payloadlen, "global");
         return;
     }
-    /* must be a dist blob: <prefix>/<arch>/dist/<profile> */
-    const char *base = strrchr(msg->topic, '/');
-    if (base) {
-        profile_t *p = find_profile(base + 1);
-        if (p && strcmp(p->last_result, "pending") == 0) {
+    if (g_meta_topic_machine[0] && strcmp(msg->topic, g_meta_topic_machine) == 0) {
+        update_meta(&g_meta_machine, msg->payload, msg->payloadlen, "per-machine");
+        return;
+    }
+    /* a dist blob — match the profile waiting on this exact topic (the dist topic
+     * embeds <macid> for per-machine, so match the full string, not a segment) */
+    for (int i = 0; i < g_cfg.nprofiles; i++) {
+        profile_t *p = &g_cfg.profiles[i];
+        if (strcmp(p->last_result, "pending") == 0 && strcmp(p->dist_topic, msg->topic) == 0) {
             logmsg("[%s] blob received (%d bytes)", p->name, msg->payloadlen);
             handle_blob(p, msg->payload, msg->payloadlen);
+            return;
         }
     }
 }
@@ -824,7 +904,8 @@ static int run_check(const char *cfgpath) {
     printf("ok: %s — %d profile(s), signatures %s\n", cfgpath, c.nprofiles,
            c.sign_enabled ? "ENFORCED (pubkey present)" : "off (no pubkey)");
     for (int i = 0; i < c.nprofiles; i++)
-        printf("  - %s -> %s%s%s\n", c.profiles[i].name, c.profiles[i].file,
+        printf("  - %s -> %s%s%s%s\n", c.profiles[i].name, c.profiles[i].file,
+               c.profiles[i].machine_specific ? " [machine-specific]" : "",
                c.profiles[i].service[0] ? " [svc:" : "", c.profiles[i].service);
     return 0;
 }
@@ -838,11 +919,14 @@ static int run_status(const char *cfgpath) {
         printf("status: config invalid: %s\n", cfgpath);
         return 1;
     }
+    if (!g_cfg.macid[0])
+        get_mac(g_cfg.macid, sizeof(g_cfg.macid)); /* derive unless config overrides */
     snprintf(g_meta_topic, sizeof(g_meta_topic), "%s/%s/meta", g_cfg.prefix, g_cfg.arch);
+    snprintf(g_meta_topic_machine, sizeof(g_meta_topic_machine), "%s/%s/meta/%s",
+             g_cfg.prefix, g_cfg.arch, g_cfg.macid);
     mosquitto_lib_init();
-    char cid[96], mac[32];
-    get_mac(mac, sizeof(mac));
-    snprintf(cid, sizeof(cid), "mqtt-deployer-status-%s", mac);
+    char cid[96];
+    snprintf(cid, sizeof(cid), "mqtt-deployer-status-%s", g_cfg.macid);
     g_mosq = mosquitto_new(cid, true, NULL);
     if (!g_mosq) {
         printf("status: mosquitto_new failed\n");
@@ -855,28 +939,32 @@ static int run_status(const char *cfgpath) {
     mosquitto_connect_callback_set(g_mosq, on_connect);
     mosquitto_message_callback_set(g_mosq, on_message);
     bool connected = mosquitto_connect(g_mosq, g_cfg.broker, g_cfg.port, 30) == MOSQ_ERR_SUCCESS;
-    for (int i = 0; i < 60 && connected && !g_meta; i++)
+    /* give both retained metas a moment to arrive */
+    for (int i = 0; i < 40 && connected; i++)
         if (mosquitto_loop(g_mosq, 50, 1) != MOSQ_ERR_SUCCESS) {
             connected = false;
             break;
         }
+    bool have_meta = g_meta_global || g_meta_machine;
 
-    printf("deployer status — arch=%s prefix=%s signatures=%s\n",
-           g_cfg.arch, g_cfg.prefix, g_cfg.sign_enabled ? "ENFORCED" : "off");
+    printf("deployer status — arch=%s prefix=%s mac=%s signatures=%s\n",
+           g_cfg.arch, g_cfg.prefix, g_cfg.macid, g_cfg.sign_enabled ? "ENFORCED" : "off");
     printf("broker %s:%d — %s\n", g_cfg.broker, g_cfg.port,
-           g_meta ? "connected, meta received" : (connected ? "connected, no meta published" : "UNREACHABLE"));
-    printf("%-20s %-12s %-13s %-13s %-8s %s\n", "profile", "version", "installed", "advertised", "sig", "state");
+           have_meta ? "connected, meta received" : (connected ? "connected, no meta published" : "UNREACHABLE"));
+    printf("%-20s %-9s %-13s %-13s %-15s %-7s %-8s %s\n", "profile", "version", "installed", "advertised", "pushed", "src", "sig", "state");
     for (int i = 0; i < g_cfg.nprofiles; i++) {
         profile_t *p       = &g_cfg.profiles[i];
         char       isha[SHA_HEX];
         bool       present = sha256_of(p->file, isha) == 0;
-        cJSON     *e       = g_meta ? cJSON_GetObjectItem(g_meta, p->name) : NULL;
+        eff_t      eff     = effective_entry(p);
+        cJSON     *e       = eff.entry;
         cJSON     *jv      = e ? cJSON_GetObjectItem(e, "version") : NULL;
         cJSON     *js      = e ? cJSON_GetObjectItem(e, "sha") : NULL;
         cJSON     *jsig    = e ? cJSON_GetObjectItem(e, "sig") : NULL;
         cJSON     *jsz     = e ? cJSON_GetObjectItem(e, "size") : NULL;
         const char *ver    = (jv && cJSON_IsString(jv)) ? jv->valuestring : "-";
         const char *advsha = (js && cJSON_IsString(js)) ? js->valuestring : NULL;
+        const char *src    = !e ? "-" : (eff.from_machine ? "machine" : "global");
 
         const char *sig;
         if (!g_cfg.sign_enabled)
@@ -887,12 +975,15 @@ static int run_status(const char *cfgpath) {
             sig = "MISSING";
         else {
             long sz = (jsz && cJSON_IsNumber(jsz)) ? (long)jsz->valuedouble : -1;
-            sig     = sig_ok(p->name, advsha ? advsha : "", sz, jsig->valuestring) ? "valid" : "INVALID";
+            char mt[160];
+            meta_topic_for(eff.from_machine, mt, sizeof(mt));
+            sig = sig_ok(mt, p->name, advsha ? advsha : "", sz, entry_ts(e), jsig->valuestring) ? "valid" : "INVALID";
         }
 
         const char *state;
         if (!e)
-            state = present ? "installed (not advertised)" : "absent, not advertised";
+            state = present ? (p->machine_specific ? "installed (await machine)" : "installed (not advertised)")
+                            : "absent, not advertised";
         else if (!present)
             state = "ABSENT (advertised)";
         else if (advsha && strcmp(isha, advsha) == 0)
@@ -904,10 +995,18 @@ static int run_status(const char *cfgpath) {
         if (p->service[0])
             snprintf(svcbuf, sizeof(svcbuf), " [%s:%s]", p->service, svc_active(p->service) ? "active" : "inactive");
 
-        char ib[13], ab[13];
+        char   ib[13], ab[13], tsbuf[20];
+        double ts = e ? entry_ts(e) : 0;
+        if (ts > 0) {
+            time_t    t = (time_t)ts;
+            struct tm tm;
+            localtime_r(&t, &tm);
+            strftime(tsbuf, sizeof(tsbuf), "%m-%d %H:%M:%S", &tm);
+        } else
+            snprintf(tsbuf, sizeof(tsbuf), "%s", "-");
         snprintf(ib, sizeof(ib), "%.12s", present ? isha : "absent");
         snprintf(ab, sizeof(ab), "%.12s", advsha ? advsha : "-");
-        printf("%-20s %-12s %-13s %-13s %-8s %s%s\n", p->name, ver, ib, ab, sig, state, svcbuf);
+        printf("%-20s %-9s %-13s %-13s %-15s %-7s %-8s %s%s\n", p->name, ver, ib, ab, tsbuf, src, sig, state, svcbuf);
     }
     mosquitto_disconnect(g_mosq);
     mosquitto_destroy(g_mosq);
@@ -952,17 +1051,18 @@ int main(int argc, char **argv) {
     signal(SIGINT, on_sig);
     signal(SIGPIPE, SIG_IGN);
 
+    if (!g_cfg.macid[0])
+        get_mac(g_cfg.macid, sizeof(g_cfg.macid)); /* derive unless config overrides */
     snprintf(g_meta_topic, sizeof(g_meta_topic), "%s/%s/meta", g_cfg.prefix, g_cfg.arch);
+    snprintf(g_meta_topic_machine, sizeof(g_meta_topic_machine), "%s/%s/meta/%s",
+             g_cfg.prefix, g_cfg.arch, g_cfg.macid);
 
     mosquitto_lib_init();
     char cid[96];
     if (g_cfg.client_id[0])
         subst(g_cfg.client_id, cid, sizeof(cid));
-    else {
-        char mac[32];
-        get_mac(mac, sizeof(mac));
-        snprintf(cid, sizeof(cid), "mqtt-deployer-%s", mac);
-    }
+    else
+        snprintf(cid, sizeof(cid), "mqtt-deployer-%s", g_cfg.macid);
     g_mosq = mosquitto_new(cid, true, NULL);
     if (!g_mosq) {
         logmsg("mosquitto_new failed");
@@ -994,7 +1094,7 @@ int main(int argc, char **argv) {
         }
         if (g_meta_dirty) {
             g_meta_dirty = false;
-            evaluate_meta();
+            evaluate();
         }
         /* retry due profiles */
         time_t now = time(NULL);
@@ -1002,16 +1102,14 @@ int main(int argc, char **argv) {
             profile_t *p = &g_cfg.profiles[i];
             if (p->next_retry && now >= p->next_retry) {
                 p->next_retry = 0;
-                if (g_meta) {
-                    cJSON *e = cJSON_GetObjectItem(g_meta, p->name);
-                    if (e && !up_to_date(p, e))
-                        request_blob(p);
-                }
+                eff_t eff     = effective_entry(p);
+                if (eff.entry && !up_to_date(p, eff.entry))
+                    request_blob(p, eff.from_machine);
             }
         }
         if (g_report_due || !reported_startup) {
             /* report once meta has been seen (or after a short grace at startup) */
-            if (g_meta || reported_startup) {
+            if (g_meta_global || g_meta_machine || reported_startup) {
                 report_inventory();
                 g_report_due     = false;
                 reported_startup = true;
@@ -1038,8 +1136,10 @@ int main(int argc, char **argv) {
     }
 
     logmsg("stopping");
-    if (g_meta)
-        cJSON_Delete(g_meta);
+    if (g_meta_global)
+        cJSON_Delete(g_meta_global);
+    if (g_meta_machine)
+        cJSON_Delete(g_meta_machine);
     mosquitto_destroy(g_mosq);
     mosquitto_lib_cleanup();
     return 0;

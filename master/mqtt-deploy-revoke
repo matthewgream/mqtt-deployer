@@ -1,0 +1,84 @@
+#!/bin/sh
+# mqtt-deploy-revoke — clear retained deployment state (the OTA layer).
+#
+#   mqtt-deploy-revoke <arch> --profile <P>            # P everywhere (global + all machines)
+#   mqtt-deploy-revoke <arch> <macid>                  # everything for one machine
+#   mqtt-deploy-revoke <arch> <macid> --profile <P>    # P for one machine
+#   mqtt-deploy-revoke <arch> --all-machines           # every per-machine override (global kept)
+#   mqtt-deploy-revoke <arch> --all                    # blank slate (global + all machines)
+#
+# Revocation = publish a zero-length retained message, which deletes the retained
+# one. This is the re-image lever ("the image is the new baseline; clear the OTA
+# layer") and the way to retire a machine's pin. Provisioning (machine-specific
+# configs) and pins are different profiles, so scope by --profile to spare the
+# former. Topology:
+#   meta global  <prefix>/<arch>/meta            dist global  <prefix>/<arch>/dist/<profile>
+#   meta machine <prefix>/<arch>/meta/<macid>    dist machine <prefix>/<arch>/dist/<profile>/<macid>
+#
+# Env: PREFIX (default iotdata/firmware), HOST (localhost), PORT (1883).
+set -eu
+
+PREFIX=${PREFIX:-iotdata/firmware}
+HOST=${HOST:-localhost}
+PORT=${PORT:-1883}
+
+PROFILE=""; ALL=0; ALLM=0; np=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --profile) PROFILE=${2:-}; shift 2 ;;
+        --profile=*) PROFILE=${1#--profile=}; shift ;;
+        --all) ALL=1; shift ;;
+        --all-machines) ALLM=1; shift ;;
+        --*) echo "unknown option: $1" >&2; exit 2 ;;
+        *) np=$((np + 1)); eval "p$np=\$1"; shift ;;
+    esac
+done
+[ "$np" -ge 1 ] || { echo "usage: $0 <arch> [<macid>] [--profile P | --all-machines | --all]" >&2; exit 2; }
+ARCH=$p1
+MACID=${p2:-}
+[ -z "$MACID" ] || case "$MACID" in *[!a-f0-9]*) echo "macid must be lowercase hex" >&2; exit 2 ;; esac
+[ -z "$PROFILE" ] || case "$PROFILE" in *[!A-Za-z0-9_.-]*) echo "bad profile name" >&2; exit 2 ;; esac
+
+B="$PREFIX/$ARCH"
+clear_topic() { mosquitto_pub -h "$HOST" -p "$PORT" -r -n -t "$1"; echo "  cleared $1"; }
+# list matching retained topics — caller MUST capture this (clearing republishes a
+# zero-length retained msg, so a live subscription would feed itself in a loop).
+list() { mosquitto_sub -h "$HOST" -p "$PORT" -t "$1" -F '%t' -W 2 2>/dev/null | sort -u; }
+read1() { mosquitto_sub -h "$HOST" -p "$PORT" -t "$1" -C 1 -W 2 2>/dev/null || true; }
+# drop one profile from a meta manifest, clearing the topic if it empties
+drop_from_meta() {
+    cur=$(read1 "$1"); [ -n "${cur:-}" ] || return 0
+    printf '%s' "$cur" | jq -e --arg p "$2" 'has($p)' >/dev/null 2>&1 || return 0
+    out=$(printf '%s' "$cur" | jq -c --arg p "$2" 'del(.[$p])')
+    if [ "$out" = '{}' ]; then clear_topic "$1"; else
+        mosquitto_pub -h "$HOST" -p "$PORT" -q 1 -r -t "$1" -m "$out"
+        echo "  dropped $2 from $1"
+    fi
+}
+
+if [ "$ALL" = 1 ]; then
+    echo "revoke ALL deployment state under $B"
+    clear_topic "$B/meta"
+    for t in $(list "$B/meta/+") $(list "$B/dist/+") $(list "$B/dist/+/+"); do clear_topic "$t"; done
+elif [ "$ALLM" = 1 ]; then
+    echo "revoke ALL per-machine overrides under $B (global kept)"
+    for t in $(list "$B/meta/+") $(list "$B/dist/+/+"); do clear_topic "$t"; done
+elif [ -n "$MACID" ] && [ -n "$PROFILE" ]; then
+    echo "revoke profile=$PROFILE for machine=$MACID"
+    drop_from_meta "$B/meta/$MACID" "$PROFILE"
+    clear_topic "$B/dist/$PROFILE/$MACID"
+elif [ -n "$MACID" ]; then
+    echo "revoke ALL state for machine=$MACID"
+    clear_topic "$B/meta/$MACID"
+    for t in $(list "$B/dist/+/$MACID"); do clear_topic "$t"; done
+elif [ -n "$PROFILE" ]; then
+    echo "revoke profile=$PROFILE everywhere (global + all machines)"
+    drop_from_meta "$B/meta" "$PROFILE"
+    clear_topic "$B/dist/$PROFILE"
+    metas=$(list "$B/meta/+"); blobs=$(list "$B/dist/$PROFILE/+")
+    for t in $metas; do drop_from_meta "$t" "$PROFILE"; done
+    for t in $blobs; do clear_topic "$t"; done
+else
+    echo "nothing to do: give <macid>, --profile P, --all-machines, or --all" >&2; exit 2
+fi
+echo "done."
