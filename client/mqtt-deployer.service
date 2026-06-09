@@ -1,0 +1,21 @@
+[Unit]
+Description=mqtt-deployer (content-addressed OTA)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+SyslogIdentifier=mqtt-deployer
+# Binary and config are chosen INDEPENDENTLY: each prefers the OTA-updated copy on
+# the writable data partition (/opt/system/data), else the baked image copy
+# (/usr/local/bin binary, /etc/default config). So a binary-only update runs the
+# new binary against the still-baked config. $$ is a literal $ for the shell
+# (systemd would otherwise treat $BIN as one of its own variables).
+ExecStart=/bin/sh -c 'BIN=/opt/system/data/mqtt-deployer; [ -x "$$BIN" ] || BIN=/usr/local/bin/mqtt-deployer; CFG=/opt/system/data/mqtt-deployer.cfg; [ -f "$$CFG" ] || CFG=/etc/default/mqtt-deployer.cfg; exec "$$BIN" --config "$$CFG"'
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
