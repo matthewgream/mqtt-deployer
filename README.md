@@ -129,10 +129,11 @@ optional `macid`, retry/jitter) plus one `[profile:<name>]` per artifact. See
 
 | option | default | meaning |
 |--------|---------|---------|
-| `file` | (required) | where the artifact is seated on the device |
+| `file` | (required) | the **override** slot — where a deployed artifact is seated on the device (writable data partition) |
+| `base` | — | the **baked fallback** path (mirrors the unit's override-preferring ExecStart). Reconciliation compares against the *effective* artifact: override `file` if present, else `base` — so a freshly imaged box whose baked base already matches the advertised sha converges with no override written. Seating is forward-only (only ever writes `file`). Omit for a device-owned artifact with no baked copy |
 | `mode` | `0644` | octal perms for the seated file (`0755` for a binary/script) |
 | `service` | — | systemd unit. Binary: stop → swap → start, then `is-active` gates rollback. Omit for a plain file/script |
-| `verify` | — | command run against the **candidate** (`<file>.new`, via `%candidate%`) *before* the swap; non-zero ⇒ reject, live file untouched. e.g. `<binary> --check %candidate%`, `%candidate% --help`, `/bin/sh -n %candidate%` |
+| `verify` | — | command run against the **candidate** (`<file>.new`, via `%candidate%`) *before* the swap; non-zero ⇒ reject, live file untouched. A **binary** self-checks config-free: `%candidate% --self-test`; a **config** is checked by the seated binary: `<binary> --check %candidate%`; a **script**: `/bin/sh -n %candidate%` |
 | `live-replace` | `false` | `true` for configs / the deployer's own files — swap while running, restart to reload (don't stop the service first) |
 | `machine-specific` | `false` | honour only the per-`<macid>` entry; ignore global |
 | `on-fail` | `rollback` | `rollback` (restore `.bak`/fall back to baked) · `retry` (after retry-normal/urgent) · `leave` |
