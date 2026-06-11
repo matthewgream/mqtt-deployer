@@ -38,6 +38,7 @@
 #include <fcntl.h>
 #include <mosquitto.h>
 #include <openssl/evp.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -59,7 +60,8 @@ typedef enum { ONFAIL_ROLLBACK, ONFAIL_RETRY, ONFAIL_LEAVE } onfail_t;
 
 typedef struct {
     char name[64];
-    char file[PATH_MAX_];
+    char file[PATH_MAX_];   /* the override/transient slot we seat into (/opt/system/data/...) */
+    char base[PATH_MAX_];   /* baked image copy the unit falls back to (/usr/local/bin or /etc/default); empty = none */
     char service[64];       /* systemd unit; empty = none */
     char verify[PATH_MAX_]; /* command; %candidate% substituted; empty = none */
     onfail_t on_fail;
@@ -175,7 +177,14 @@ static void subst(const char *tmpl, char *out, size_t outsz) {
     out[o < outsz ? o : outsz - 1] = '\0';
 }
 
-/* run argv, capture stdout into buf (NUL-terminated). returns exit code or -1 */
+/* All commands we run (verify, sha256sum, systemctl) are short-lived. Bound them
+ * so a misbehaving one — e.g. a verify binary that ignores its flags and
+ * daemonizes instead of exiting — can't wedge the deployer forever. */
+#define CMD_TIMEOUT_SECS 60
+
+/* run argv, capture stdout into buf (NUL-terminated). returns exit code, or -1 on
+ * spawn error / timeout. The child runs in its own process group so a timeout can
+ * kill the whole tree (not just the direct child). */
 static int run_capture(char *const argv[], char *buf, size_t bufsz) {
     int pipefd[2];
     if (buf)
@@ -189,28 +198,59 @@ static int run_capture(char *const argv[], char *buf, size_t bufsz) {
         return -1;
     }
     if (pid == 0) {
+        setpgid(0, 0); /* own process group, so the parent can kill the tree on timeout */
         dup2(pipefd[1], STDOUT_FILENO);
         close(pipefd[0]);
         close(pipefd[1]);
         execvp(argv[0], argv);
         _exit(127);
     }
+    (void)setpgid(pid, pid); /* race-safe: child does the same; one wins, both idempotent */
     close(pipefd[1]);
+    const time_t deadline = time(NULL) + CMD_TIMEOUT_SECS;
+    bool timed_out = false;
     size_t n = 0;
-    if (buf) {
-        ssize_t r;
-        while (n + 1 < bufsz && (r = read(pipefd[0], buf + n, bufsz - 1 - n)) > 0)
-            n += (size_t)r;
-        buf[n] = '\0';
+    for (;;) {
+        const long rem_ms = (long)(deadline - time(NULL)) * 1000;
+        if (rem_ms <= 0) {
+            timed_out = true;
+            break;
+        }
+        struct pollfd pfd = { .fd = pipefd[0], .events = POLLIN, .revents = 0 };
+        const int pr = poll(&pfd, 1, (int)rem_ms);
+        if (pr == 0) {
+            timed_out = true;
+            break;
+        }
+        if (pr < 0) {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+        char chunk[256];
+        const ssize_t r = read(pipefd[0], chunk, sizeof(chunk));
+        if (r <= 0)
+            break; /* EOF (child closed stdout) or read error */
+        if (buf && n + 1 < bufsz) {
+            size_t cp = (size_t)r;
+            if (n + cp + 1 > bufsz)
+                cp = bufsz - 1 - n;
+            memcpy(buf + n, chunk, cp);
+            n += cp;
+        }
     }
-    /* drain */
-    char drain[256];
-    while (read(pipefd[0], drain, sizeof(drain)) > 0)
-        ;
+    if (buf)
+        buf[n] = '\0';
+    if (timed_out) {
+        logmsg("command timed out after %ds, killing: %s", CMD_TIMEOUT_SECS, argv[0]);
+        kill(-pid, SIGKILL); /* whole process group */
+    }
     close(pipefd[0]);
     int st = 0;
     while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
         ;
+    if (timed_out)
+        return -1;
     return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 }
 
@@ -240,6 +280,20 @@ static long file_size(const char *path) {
     return stat(path, &st) == 0 ? (long)st.st_size : -1;
 }
 
+/* The artifact the unit actually runs: the override slot (prof->file) if it
+ * exists, else the baked base. Reconciliation and reporting compare against THIS
+ * — so a fresh baked image whose base already matches the advertised sha is
+ * converged WITHOUT writing a redundant override. (Seating always writes the
+ * override: forward-only, we never prune back to base. The override is a
+ * strictly-forward patch slot; base is just the convergence floor.) */
+static const char *effective_path(const profile_t *prof) {
+    if (access(prof->file, F_OK) == 0)
+        return prof->file;
+    if (prof->base[0] && access(prof->base, F_OK) == 0)
+        return prof->base;
+    return prof->file; /* nothing present -> caller resolves as absent */
+}
+
 /* write len bytes to path atomically-ish (caller renames). returns 0/-1 */
 static int write_all(const char *path, const void *data, size_t len) {
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -257,6 +311,56 @@ static int write_all(const char *path, const void *data, size_t len) {
     }
     int rc = fsync(fd);
     return close(fd) == 0 && rc == 0 ? 0 : -1;
+}
+
+/* copy src -> dst with the given mode, crossing filesystems (the override lives
+ * on the data partition, the base on the rootfs, so rename() = EXDEV). Atomic on
+ * the dst side: write dst.promote, fsync, chmod, rename into place. 0 ok / -1. */
+static int copy_file(const char *src, const char *dst, mode_t mode) {
+    int in = open(src, O_RDONLY);
+    if (in < 0)
+        return -1;
+    char tmp[PATH_MAX_ + 16];
+    snprintf(tmp, sizeof(tmp), "%s.promote", dst);
+    int out = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, mode);
+    if (out < 0) {
+        close(in);
+        return -1;
+    }
+    int rc = 0;
+    char buf[65536];
+    for (;;) {
+        ssize_t r = read(in, buf, sizeof(buf));
+        if (r == 0)
+            break;
+        if (r < 0) {
+            rc = -1;
+            break;
+        }
+        for (ssize_t off = 0; off < r;) {
+            ssize_t w = write(out, buf + off, (size_t)(r - off));
+            if (w <= 0) {
+                rc = -1;
+                break;
+            }
+            off += w;
+        }
+        if (rc != 0)
+            break;
+    }
+    if (rc == 0 && fsync(out) != 0)
+        rc = -1;
+    close(in);
+    if (close(out) != 0)
+        rc = -1;
+    if (rc == 0) {
+        (void)chmod(tmp, mode);
+        if (rename(tmp, dst) != 0)
+            rc = -1;
+    }
+    if (rc != 0)
+        (void)unlink(tmp);
+    return rc;
 }
 
 /* xz -dc in > out (no shell). returns 0/-1 */
@@ -477,6 +581,8 @@ static int config_load(config_t *c, const char *path, bool verbose) {
         } else if (prof) {
             if (strcmp(key, "file") == 0)
                 snprintf(prof->file, sizeof(prof->file), "%s", val);
+            else if (strcmp(key, "base") == 0)
+                snprintf(prof->base, sizeof(prof->base), "%s", val);
             else if (strcmp(key, "service") == 0)
                 snprintf(prof->service, sizeof(prof->service), "%s", val);
             else if (strcmp(key, "verify") == 0)
@@ -649,7 +755,7 @@ static void report_inventory(void) {
     for (int i = 0; i < g_cfg.nprofiles; i++) {
         profile_t *p = &g_cfg.profiles[i];
         char sha[SHA_HEX];
-        if (sha256_of(p->file, sha) != 0)
+        if (sha256_of(effective_path(p), sha) != 0)
             snprintf(sha, sizeof(sha), "%s", "absent");
         cJSON *e = cJSON_AddObjectToObject(profs, p->name);
         cJSON_AddStringToObject(e, "sha", sha);
@@ -718,17 +824,18 @@ static void meta_topic_for(bool from_machine, char *out, size_t outsz) {
         snprintf(out, outsz, "%s/%s/meta", g_cfg.prefix, g_cfg.arch);
 }
 
-/* does the installed file already match the meta entry's sha/size? */
+/* does the effective (override-else-base) file already match the meta sha/size? */
 static bool up_to_date(profile_t *prof, cJSON *entry) {
     cJSON *jsha = cJSON_GetObjectItem(entry, "sha");
     cJSON *jsize = cJSON_GetObjectItem(entry, "size");
     if (!cJSON_IsString(jsha))
         return false;
+    const char *path = effective_path(prof);
     long want_size = cJSON_IsNumber(jsize) ? (long)jsize->valuedouble : -1;
-    if (want_size >= 0 && file_size(prof->file) != want_size)
+    if (want_size >= 0 && file_size(path) != want_size)
         return false; /* cheap reject */
     char have[SHA_HEX];
-    if (sha256_of(prof->file, have) != 0)
+    if (sha256_of(path, have) != 0)
         return false; /* absent -> needs install */
     return strcmp(have, jsha->valuestring) == 0;
 }
@@ -744,14 +851,24 @@ static void request_blob(profile_t *prof, bool from_machine) {
 
 /* evaluate all profiles against the merged (global + per-machine) meta */
 static void evaluate(void) {
-    if (!g_meta_global && !g_meta_machine)
-        return;
     for (int i = 0; i < g_cfg.nprofiles; i++) {
         profile_t *p = &g_cfg.profiles[i];
         eff_t eff = effective_entry(p);
         cJSON *entry = eff.entry;
-        if (!entry)
-            continue; /* nothing advertised for this profile in either stream */
+        if (!entry) {
+            /* Nothing advertised for this profile in either stream now. If it was in
+             * a determined state (a per-machine override just revoked, or the meta
+             * cleared), reset it to "none" and force a fresh inventory report — so the
+             * fleet's convergence view follows the truth instead of showing a stale
+             * "ok". (We no longer early-return when both streams are empty: a full
+             * clear must still drive every profile back to "none".) */
+            if (strcmp(p->last_result, "none") != 0) {
+                snprintf(p->last_result, sizeof(p->last_result), "%s", "none");
+                p->version[0] = '\0';
+                g_report_due = true;
+            }
+            continue;
+        }
         cJSON *jver = cJSON_GetObjectItem(entry, "version");
         if (cJSON_IsString(jver))
             snprintf(p->version, sizeof(p->version), "%s", jver->valuestring);
@@ -950,7 +1067,7 @@ static int run_status(const char *cfgpath) {
     for (int i = 0; i < g_cfg.nprofiles; i++) {
         profile_t *p = &g_cfg.profiles[i];
         char isha[SHA_HEX];
-        bool present = sha256_of(p->file, isha) == 0;
+        bool present = sha256_of(effective_path(p), isha) == 0;
         eff_t eff = effective_entry(p);
         cJSON *e = eff.entry;
         cJSON *jv = e ? cJSON_GetObjectItem(e, "version") : NULL;
@@ -1008,13 +1125,126 @@ static int run_status(const char *cfgpath) {
     return 0;
 }
 
+/* one-line file summary: "12caf8bd596e 75764B 0755" or "absent" */
+static void describe(const char *path, char *out, size_t outsz) {
+    char sha[SHA_HEX];
+    long sz = file_size(path);
+    if (sz < 0 || sha256_of(path, sha) != 0) {
+        snprintf(out, outsz, "absent");
+        return;
+    }
+    struct stat st;
+    unsigned m = (stat(path, &st) == 0) ? (unsigned)(st.st_mode & 07777) : 0;
+    snprintf(out, outsz, "%.12s %ldB %04o", sha, sz, m);
+}
+
+/* --promote [<profile>]: bake each profile's override (file) into its baked base,
+ * then clear the override so the box runs from the baseline and /opt/system/data
+ * goes clean. TWO PHASES on purpose: check EVERY candidate first (verify), and
+ * abort with ZERO changes if any fails — never get half-way then bail. `only` =
+ * one profile name, or NULL for all. Run with services stopped (see go-golden).
+ * Profiles with no `base` (device-owned, e.g. machine-cfg) are kept untouched. */
+static int run_promote(const char *cfgpath, const char *only) {
+    config_t c;
+    if (config_load(&c, cfgpath, true) != 0) {
+        printf("promote: invalid config %s\n", cfgpath);
+        return 1;
+    }
+    printf("=== iotdata-deploy --promote (%s) ===\n", only ? only : "all profiles");
+    printf("config : %s\n\n", cfgpath);
+    printf("--- phase 1: check all candidates (NO changes made) ---\n");
+
+    bool cand[MAX_PROFILES];
+    int ncand = 0, nfail = 0, nkeep = 0, nskip = 0, nmatch = 0;
+    for (int i = 0; i < c.nprofiles; i++) {
+        profile_t *p = &c.profiles[i];
+        cand[i] = false;
+        if (only && strcmp(p->name, only) != 0)
+            continue;
+        nmatch++;
+        if (!p->base[0]) {
+            printf("  %-20s KEEP   no base (device-owned) — override left as-is\n", p->name);
+            nkeep++;
+            continue;
+        }
+        if (access(p->file, F_OK) != 0) {
+            printf("  %-20s skip   no override present — already at base\n", p->name);
+            nskip++;
+            continue;
+        }
+        char od[96], bd[96];
+        describe(p->file, od, sizeof(od));
+        describe(p->base, bd, sizeof(bd));
+        int vrc = 0;
+        if (p->verify[0]) {
+            char store[1100], *argv[64];
+            build_argv(p->verify, p->file, store, sizeof(store), argv, 64);
+            vrc = run_cmd(argv);
+        }
+        const char *warn = (p->service[0] && svc_active(p->service)) ? "  [WARN: service active]" : "";
+        printf("  %-20s %-4s   override %s  ->  base %s%s\n", p->name, vrc == 0 ? "ok" : "FAIL", od, bd, warn);
+        printf("  %-20s          base path: %s\n", "", p->base);
+        cand[i] = true;
+        ncand++;
+        if (vrc != 0)
+            nfail++;
+    }
+    if (nmatch == 0) {
+        printf("\npromote: no profile matches '%s'\n", only ? only : "");
+        return 2;
+    }
+    printf("\ncheck: %d candidate(s) to promote, %d kept, %d skipped, %d FAILED\n", ncand, nkeep, nskip, nfail);
+    if (nfail > 0) {
+        printf("\nABORT: %d candidate(s) failed verification — NO changes made.\n", nfail);
+        return 1;
+    }
+    if (ncand == 0) {
+        printf("\nnothing to promote.\n");
+        return 0;
+    }
+
+    printf("\n--- phase 2: promote (override -> base, then clear override) ---\n");
+    int done = 0, perr = 0;
+    for (int i = 0; i < c.nprofiles; i++) {
+        if (!cand[i])
+            continue;
+        profile_t *p = &c.profiles[i];
+        char before[96];
+        describe(p->base, before, sizeof(before));
+        if (copy_file(p->file, p->base, p->mode) != 0) {
+            printf("  %-20s ERROR  copy %s -> %s: %s\n", p->name, p->file, p->base, strerror(errno));
+            perr++;
+            continue;
+        }
+        (void)unlink(p->file); /* clear the override + leftovers so base wins */
+        const char *sfx[] = { ".bak", ".new", ".dl", ".dlx", ".promote" };
+        for (size_t k = 0; k < sizeof(sfx) / sizeof(sfx[0]); k++) {
+            char lp[PATH_MAX_ + 16];
+            snprintf(lp, sizeof(lp), "%s%s", p->file, sfx[k]);
+            (void)unlink(lp);
+        }
+        char after[96];
+        describe(p->base, after, sizeof(after));
+        printf("  %-20s base %s -> %s ; override cleared\n", p->name, before, after);
+        done++;
+    }
+    printf("\n=== promote done: %d promoted, %d kept, %d skipped, %d error(s) ===\n", done, nkeep, nskip, perr);
+    return perr == 0 ? 0 : 1;
+}
+
 static void usage(const char *a0) {
-    printf("usage: %s --config <file> [--status] | --check <file> | --help\n", a0);
+    printf("usage: %s --config <file> [--status | --promote [<profile>]] | --check <file> | --help\n", a0);
 }
 
 int main(int argc, char **argv) {
+    for (int i = 1; i < argc; i++)
+        if (strcmp(argv[i], "--self-test") == 0) {
+            printf("Self-test reports OK\n");
+            return EXIT_SUCCESS;
+        }
     const char *cfgpath = NULL;
-    bool want_status = false;
+    bool want_status = false, want_promote = false;
+    const char *promote_only = NULL;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
@@ -1023,7 +1253,11 @@ int main(int argc, char **argv) {
             return run_check(argv[++i]);
         else if (strcmp(argv[i], "--status") == 0)
             want_status = true;
-        else if (strcmp(argv[i], "--config") == 0 && i + 1 < argc)
+        else if (strcmp(argv[i], "--promote") == 0) {
+            want_promote = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') /* optional profile name */
+                promote_only = argv[++i];
+        } else if (strcmp(argv[i], "--config") == 0 && i + 1 < argc)
             cfgpath = argv[++i];
         else {
             usage(argv[0]);
@@ -1036,6 +1270,8 @@ int main(int argc, char **argv) {
     }
     if (want_status)
         return run_status(cfgpath);
+    if (want_promote)
+        return run_promote(cfgpath, promote_only);
     if (config_load(&g_cfg, cfgpath, true) != 0) {
         logmsg("invalid config %s", cfgpath);
         return 1;
