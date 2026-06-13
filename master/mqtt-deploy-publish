@@ -58,6 +58,31 @@ if [ -n "$MACID" ]; then
 fi
 [ "$REVOKE" = 1 ] && [ -n "$MACID" ] && { echo "--revoke is for global pushes (drop --macid)" >&2; exit 2; }
 
+# arch guard: if the artifact is an ELF, its machine type must match the declared ARCH. Cheap
+# backstop against a native build masking a cross-build (Make's "Nothing to be done" reuses an
+# x86 binary), which would publish a wrong-arch blob and brick the target on restart. Non-ELF
+# artifacts (configs/scripts) and arch labels we don't recognise pass through untouched.
+if command -v file >/dev/null 2>&1; then
+    elf=$(file -b "$FILE" 2>/dev/null || true)
+    case "$elf" in
+        *ELF*)
+            bad=0
+            case "$ARCH" in
+                arm | armv6 | armv7 | armhf)
+                    case "$elf" in
+                        *aarch64*) bad=1 ;;
+                        *32-bit*) case "$elf" in *ARM*) ;; *) bad=1 ;; esac ;;
+                        *) bad=1 ;;
+                    esac ;;
+                arm64 | aarch64) case "$elf" in *aarch64*) ;; *) bad=1 ;; esac ;;
+                amd64 | x86_64 | x86-64) case "$elf" in *x86-64*) ;; *) bad=1 ;; esac ;;
+                *) ;; # unrecognised arch label — don't block (forward-compat)
+            esac
+            [ "$bad" = 0 ] || { echo "ERROR: '$FILE' is [$elf] — does not match declared arch '$ARCH'; refusing wrong-arch publish" >&2; exit 1; } ;;
+        *) ;; # not an ELF (config/text artifact) — nothing to check
+    esac
+fi
+
 # topic layout: per-machine if --macid, else global
 if [ -n "$MACID" ]; then
     meta_topic="$PREFIX/$ARCH/meta/$MACID"

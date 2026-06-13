@@ -4,7 +4,7 @@
 CC      = gcc
 # (no -Wwrite-strings: this program is exec-heavy and the execvp argv idiom
 #  fights it; explicit casts on const args keep us honest instead.)
-CFLAGS  = -Wall -Wextra -Wpedantic -Werror \
+CFLAGS  = -O3 -Wall -Wextra -Wpedantic -Werror \
           -Wstrict-prototypes -Wold-style-definition \
           -Wshadow -Wpointer-arith -Wredundant-decls \
           -Wmissing-include-dirs -Wnull-dereference

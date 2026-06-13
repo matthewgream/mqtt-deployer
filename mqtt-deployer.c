@@ -85,6 +85,7 @@ typedef struct {
     char cafile[PATH_MAX_];
     char username[64];
     char password[128];
+    char master_config[PATH_MAX_]; /* if set, load broker/user/pass + CA from this file (single source) */
     char arch[32];
     char prefix[64];        /* default iotdata/firmware */
     char status_topic[256]; /* %mac% / %host% substituted */
@@ -470,6 +471,66 @@ static void config_defaults(config_t *c) {
     c->jitter = 0;
 }
 
+/* master-config (single source of truth): when [deployer] sets master-config=<path>, load
+ * broker/username/password + the inline CA PEM from that file (e.g. /opt/system/data/iotdata-master.cfg),
+ * overriding the legacy inline creds. The trailing PEM block is materialized to tmpfs for TLS. The fleet
+ * port defaults to 46832 (override with broker host:port). Best-effort: a missing file leaves legacy creds. */
+static int apply_master_config(config_t *c, bool verbose) {
+    FILE *f = fopen(c->master_config, "re");
+    if (!f) {
+        if (verbose)
+            logmsg("master-config %s unreadable (%s) — keeping legacy creds", c->master_config, strerror(errno));
+        return -1;
+    }
+    c->tls = true;
+    c->port = 46832; /* baked iotdata fleet port; broker host:port overrides */
+    const char *capath = "/run/iotdata/fleet-ca.crt";
+    (void)mkdir("/run/iotdata", 0755);
+    FILE *ca = NULL;
+    char line[1024];
+    int in_pem = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (in_pem || strncmp(line, "-----BEGIN CERTIFICATE-----", 27) == 0) {
+            in_pem = 1;
+            if (!ca)
+                ca = fopen(capath, "we");
+            if (ca)
+                fputs(line, ca);
+            continue;
+        }
+        char *s = lstrip(line);
+        rstrip(s);
+        if (*s == '\0' || *s == '#')
+            continue;
+        char *eq = strchr(s, '=');
+        if (!eq)
+            continue;
+        *eq = '\0';
+        char *key = s;
+        rstrip(key);
+        char *val = lstrip(eq + 1);
+        if (strcmp(key, "broker") == 0) {
+            char *colon = strrchr(val, ':');
+            if (colon) {
+                *colon = '\0';
+                c->port = atoi(colon + 1);
+            }
+            snprintf(c->broker, sizeof(c->broker), "%s", val);
+        } else if (strcmp(key, "username") == 0)
+            snprintf(c->username, sizeof(c->username), "%s", val);
+        else if (strcmp(key, "password") == 0)
+            snprintf(c->password, sizeof(c->password), "%s", val);
+    }
+    if (ca)
+        (void)fclose(ca);
+    (void)fclose(f);
+    if (ca)
+        snprintf(c->cafile, sizeof(c->cafile), "%s", capath);
+    if (verbose)
+        logmsg("master-config %s: broker=%s port=%d user=%s ca=%s", c->master_config, c->broker, c->port, c->username, c->cafile);
+    return 0;
+}
+
 /* returns 0 ok, -1 parse/validation error (msg to stderr) */
 static int config_load(config_t *c, const char *path, bool verbose) {
     config_defaults(c);
@@ -548,6 +609,8 @@ static int config_load(config_t *c, const char *path, bool verbose) {
                 snprintf(c->username, sizeof(c->username), "%s", val);
             else if (strcmp(key, "password") == 0)
                 snprintf(c->password, sizeof(c->password), "%s", val);
+            else if (strcmp(key, "master-config") == 0)
+                snprintf(c->master_config, sizeof(c->master_config), "%s", val);
             else if (strcmp(key, "arch") == 0)
                 snprintf(c->arch, sizeof(c->arch), "%s", val);
             else if (strcmp(key, "prefix") == 0)
@@ -606,6 +669,8 @@ static int config_load(config_t *c, const char *path, bool verbose) {
         }
     }
     (void)fclose(f);
+    if (c->master_config[0] != '\0')
+        (void)apply_master_config(c, verbose); /* best-effort; missing/unreadable -> keep legacy inline creds */
     /* validate */
     for (int i = 0; i < c->nprofiles; i++) {
         if (c->profiles[i].file[0] == '\0') {
