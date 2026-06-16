@@ -51,12 +51,21 @@
 #include <unistd.h>
 
 #define MAX_PROFILES 32
+#define MAX_KEYS     8  /* named ed25519 signing keys in the [keys] store */
 #define SHA_HEX      65 /* 64 hex + NUL */
 #define PATH_MAX_    512
 
 /* ---- config ------------------------------------------------------------- */
 
 typedef enum { ONFAIL_ROLLBACK, ONFAIL_RETRY, ONFAIL_LEAVE } onfail_t;
+
+/* a named ed25519 public key in the [keys] store; profiles accept a signature from
+ * any of the keys they name (see profile.keys). "signkey_t" not "key_t" — key_t is a
+ * POSIX IPC type from <sys/types.h>. */
+typedef struct {
+    char name[64];
+    unsigned char pub[32];
+} signkey_t;
 
 typedef struct {
     char name[64];
@@ -69,6 +78,7 @@ typedef struct {
     bool live_replace;     /* file swappable while service runs (config, or self) */
     bool machine_specific; /* only honour the per-<macid> entry; ignore global */
     mode_t mode;           /* permissions for the seated file (default 0644) */
+    char keys[128];        /* accepted signing-key names (comma/space list); empty => the "default" key if present */
     /* runtime state */
     char installed_sha[SHA_HEX]; /* sha of the seated file (cache) */
     char version[64];            /* last applied version from meta */
@@ -93,9 +103,12 @@ typedef struct {
     int retry_normal;
     int retry_urgent;
     int jitter;
-    bool sign_enabled;          /* a pubkey was configured => signatures enforced */
-    unsigned char sign_pub[32]; /* raw ed25519 public key */
-    char macid[32];             /* this device's mac (hex), for the per-machine stream */
+    bool sign_enabled;             /* >=1 signing key configured => signatures in play (per-profile gates the rest) */
+    signkey_t keys[MAX_KEYS];      /* named ed25519 public keys; profiles accept any they list */
+    int nkeys;
+    char master_pubkey_name[64];   /* [deployer] master-pubkey=<name>: register master-config's signing key here */
+    char signing_pubkey_b64[64];   /* staged from master-config "signing-pubkey="; injected after apply_master_config */
+    char macid[32];                /* this device's mac (hex), for the per-machine stream */
     profile_t profiles[MAX_PROFILES];
     int nprofiles;
 } config_t;
@@ -409,42 +422,95 @@ static int b64decode(const char *in, unsigned char *out, int outsz) {
     return n;
 }
 
-/* Verify the manufacturer's ed25519 signature over the canonical meta entry
- * "<meta-topic>\n<profile>\n<sha>\n<size>\n<ts>\n". Returns true when signing is
- * NOT enforced (no pubkey configured), or when the signature is present and
- * valid; false (fail-closed) when enforced and the signature is missing/bad. The
- * meta-topic binds the entry to its stream (global vs this machine), ts binds the
- * precedence version, and <sha> binds the bytes — the blob's own sha is checked
- * separately after download. */
-static bool sig_ok(const char *meta_topic, const char *profile, const char *sha, long size, double ts, const char *sig_b64) {
-    if (!g_cfg.sign_enabled)
-        return true;
+/* ---- signing-key store -------------------------------------------------- */
+
+/* add-or-replace a named 32-byte ed25519 public key. A repeated name overwrites
+ * (lets master-pubkey override a placeholder, last-wins on dup config lines).
+ * Returns 0 ok, -1 if the store is full. */
+static int key_add(config_t *c, const char *name, const unsigned char raw32[32]) {
+    for (int i = 0; i < c->nkeys; i++)
+        if (strcmp(c->keys[i].name, name) == 0) {
+            memcpy(c->keys[i].pub, raw32, 32);
+            return 0;
+        }
+    if (c->nkeys >= MAX_KEYS)
+        return -1;
+    snprintf(c->keys[c->nkeys].name, sizeof(c->keys[c->nkeys].name), "%s", name);
+    memcpy(c->keys[c->nkeys].pub, raw32, 32);
+    c->nkeys++;
+    return 0;
+}
+
+static const signkey_t *key_find(const config_t *c, const char *name) {
+    for (int i = 0; i < c->nkeys; i++)
+        if (strcmp(c->keys[i].name, name) == 0)
+            return &c->keys[i];
+    return NULL;
+}
+
+/* Resolve which signing keys a profile accepts: the names in its keys= list, or
+ * the "default" key when it lists none. Fills pubs[] with pointers to the raw
+ * 32-byte keys; returns the count. 0 => this profile is NOT signature-gated. */
+static int profile_keys(const config_t *c, const profile_t *p, const unsigned char *pubs[], int maxpubs) {
+    int n = 0;
+    if (p->keys[0]) {
+        char buf[sizeof(p->keys)];
+        snprintf(buf, sizeof(buf), "%s", p->keys);
+        for (char *tok = strtok(buf, ", \t"); tok && n < maxpubs; tok = strtok(NULL, ", \t")) {
+            const signkey_t *k = key_find(c, tok);
+            if (k)
+                pubs[n++] = k->pub;
+        }
+    } else {
+        const signkey_t *k = key_find(c, "default");
+        if (k && n < maxpubs)
+            pubs[n++] = k->pub;
+    }
+    return n;
+}
+
+/* Verify the ed25519 signature over the canonical meta entry
+ * "<meta-topic>\n<profile>\n<sha>\n<size>\n<ts>\n", accepting any of the keys the
+ * profile lists (see profile_keys). Returns true when the profile is NOT
+ * signature-gated (no keys resolve), or when the signature is present and valid
+ * under one of them; false (fail-closed) when gated and the signature is
+ * missing/bad. The meta-topic binds the entry to its stream (global vs this
+ * machine), ts binds the precedence version, and <sha> binds the bytes — the
+ * blob's own sha is checked separately after download. */
+static bool sig_ok(const char *meta_topic, const profile_t *p, const char *sha, long size, double ts, const char *sig_b64) {
+    const unsigned char *pubs[MAX_KEYS];
+    int npubs = profile_keys(&g_cfg, p, pubs, MAX_KEYS);
+    if (npubs == 0)
+        return true; /* not signature-gated */
     if (!sig_b64 || !*sig_b64) {
-        logmsg("[%s] signature required but none advertised -> reject", profile);
+        logmsg("[%s] signature required but none advertised -> reject", p->name);
         return false;
     }
     unsigned char sig[80];
     int siglen = b64decode(sig_b64, sig, (int)sizeof(sig));
     if (siglen != 64) {
-        logmsg("[%s] malformed signature -> reject", profile);
+        logmsg("[%s] malformed signature -> reject", p->name);
         return false;
     }
     char payload[400];
-    int plen = snprintf(payload, sizeof(payload), "%s\n%s\n%s\n%ld\n%lld\n", meta_topic, profile, sha, size, (long long)ts);
+    int plen = snprintf(payload, sizeof(payload), "%s\n%s\n%s\n%ld\n%lld\n", meta_topic, p->name, sha, size, (long long)ts);
     if (plen <= 0 || plen >= (int)sizeof(payload))
         return false;
-    EVP_PKEY *pk = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, NULL, g_cfg.sign_pub, 32);
-    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-    bool ok = false;
-    if (pk && ctx && EVP_DigestVerifyInit(ctx, NULL, NULL, NULL, pk) == 1)
-        ok = EVP_DigestVerify(ctx, sig, (size_t)siglen, (const unsigned char *)payload, (size_t)plen) == 1;
-    if (ctx)
-        EVP_MD_CTX_free(ctx);
-    if (pk)
-        EVP_PKEY_free(pk);
-    if (!ok)
-        logmsg("[%s] SIGNATURE VERIFICATION FAILED -> reject", profile);
-    return ok;
+    for (int i = 0; i < npubs; i++) {
+        EVP_PKEY *pk = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, NULL, pubs[i], 32);
+        EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+        bool ok = false;
+        if (pk && ctx && EVP_DigestVerifyInit(ctx, NULL, NULL, NULL, pk) == 1)
+            ok = EVP_DigestVerify(ctx, sig, (size_t)siglen, (const unsigned char *)payload, (size_t)plen) == 1;
+        if (ctx)
+            EVP_MD_CTX_free(ctx);
+        if (pk)
+            EVP_PKEY_free(pk);
+        if (ok)
+            return true;
+    }
+    logmsg("[%s] SIGNATURE VERIFICATION FAILED (tried %d key(s)) -> reject", p->name, npubs);
+    return false;
 }
 
 /* ---- INI config --------------------------------------------------------- */
@@ -520,6 +586,8 @@ static int apply_master_config(config_t *c, bool verbose) {
             snprintf(c->username, sizeof(c->username), "%s", val);
         else if (strcmp(key, "password") == 0)
             snprintf(c->password, sizeof(c->password), "%s", val);
+        else if (strcmp(key, "signing-pubkey") == 0)
+            snprintf(c->signing_pubkey_b64, sizeof(c->signing_pubkey_b64), "%s", val); /* injected by master-pubkey= */
     }
     if (ca)
         (void)fclose(ca);
@@ -542,6 +610,7 @@ static int config_load(config_t *c, const char *path, bool verbose) {
     }
     char line[1024];
     int in_deployer = 0;
+    int in_keys = 0;
     profile_t *prof = NULL;
     int lineno = 0;
     int err = 0;
@@ -562,9 +631,12 @@ static int config_load(config_t *c, const char *path, bool verbose) {
             *end = '\0';
             char *sec = s + 1;
             in_deployer = 0;
+            in_keys = 0;
             prof = NULL;
             if (strcmp(sec, "deployer") == 0) {
                 in_deployer = 1;
+            } else if (strcmp(sec, "keys") == 0) {
+                in_keys = 1;
             } else if (strncmp(sec, "profile:", 8) == 0) {
                 if (c->nprofiles >= MAX_PROFILES) {
                     if (verbose)
@@ -628,19 +700,41 @@ static int config_load(config_t *c, const char *path, bool verbose) {
             else if (strcmp(key, "jitter") == 0)
                 c->jitter = atoi(val);
             else if (strcmp(key, "pubkey") == 0) {
-                /* inline base64 of the manufacturer's 32-byte ed25519 public
-                 * key. Its mere presence turns signature enforcement ON. */
+                /* grandfathered single-key form: registers the named key "default",
+                 * which any profile without an explicit keys= list accepts. Same
+                 * behaviour as before for existing configs. */
                 unsigned char raw[48];
                 if (b64decode(val, raw, (int)sizeof(raw)) == 32) {
-                    memcpy(c->sign_pub, raw, 32);
-                    c->sign_enabled = true;
+                    if (key_add(c, "default", raw) != 0) {
+                        if (verbose)
+                            logmsg("%s:%d: too many signing keys (max %d)", path, lineno, MAX_KEYS);
+                        err = 1;
+                    }
                 } else {
                     if (verbose)
                         logmsg("%s:%d: pubkey must be base64 of a 32-byte ed25519 key", path, lineno);
                     err = 1; /* fail-closed: a broken pubkey is a hard error */
                 }
-            } else if (verbose)
+            } else if (strcmp(key, "master-pubkey") == 0)
+                /* register the signing key carried in master-config (signing-pubkey=)
+                 * under this name, after apply_master_config runs (see below). */
+                snprintf(c->master_pubkey_name, sizeof(c->master_pubkey_name), "%s", val);
+            else if (verbose)
                 logmsg("%s:%d: unknown [deployer] key '%s'", path, lineno, key);
+        } else if (in_keys) {
+            /* [keys] name = <base64 32-byte ed25519 public key> */
+            unsigned char raw[48];
+            if (b64decode(val, raw, (int)sizeof(raw)) == 32) {
+                if (key_add(c, key, raw) != 0) {
+                    if (verbose)
+                        logmsg("%s:%d: too many signing keys (max %d)", path, lineno, MAX_KEYS);
+                    err = 1;
+                }
+            } else {
+                if (verbose)
+                    logmsg("%s:%d: key '%s' must be base64 of a 32-byte ed25519 key", path, lineno, key);
+                err = 1; /* fail-closed */
+            }
         } else if (prof) {
             if (strcmp(key, "file") == 0)
                 snprintf(prof->file, sizeof(prof->file), "%s", val);
@@ -660,6 +754,8 @@ static int config_load(config_t *c, const char *path, bool verbose) {
                 prof->machine_specific = parse_bool(val);
             else if (strcmp(key, "mode") == 0)
                 prof->mode = (mode_t)strtol(val, NULL, 8);
+            else if (strcmp(key, "keys") == 0)
+                snprintf(prof->keys, sizeof(prof->keys), "%s", val); /* accepted signing-key names */
             else if (verbose)
                 logmsg("%s:%d: unknown [profile] key '%s'", path, lineno, key);
         } else {
@@ -671,12 +767,50 @@ static int config_load(config_t *c, const char *path, bool verbose) {
     (void)fclose(f);
     if (c->master_config[0] != '\0')
         (void)apply_master_config(c, verbose); /* best-effort; missing/unreadable -> keep legacy inline creds */
+    /* master-pubkey=<name>: register the fleet signing key carried in master-config
+     * (signing-pubkey=) under that name, so profiles accept it like any [keys] entry.
+     * The deployer is key-provenance-agnostic — this is just where the fleet's key,
+     * cut into the enrolment by the master, lands in the store. */
+    if (c->master_pubkey_name[0]) {
+        if (!c->signing_pubkey_b64[0]) {
+            if (verbose)
+                logmsg("master-pubkey=%s set but master-config carried no signing-pubkey", c->master_pubkey_name);
+            err = 1; /* fail-closed: asked to trust a key that isn't there */
+        } else {
+            unsigned char raw[48];
+            if (b64decode(c->signing_pubkey_b64, raw, (int)sizeof(raw)) == 32) {
+                if (key_add(c, c->master_pubkey_name, raw) != 0) {
+                    if (verbose)
+                        logmsg("master-pubkey: signing-key store full (max %d)", MAX_KEYS);
+                    err = 1;
+                }
+            } else {
+                if (verbose)
+                    logmsg("master-config signing-pubkey is not base64 of a 32-byte ed25519 key");
+                err = 1;
+            }
+        }
+    }
+    c->sign_enabled = c->nkeys > 0; /* any key configured => signatures are in play */
     /* validate */
     for (int i = 0; i < c->nprofiles; i++) {
-        if (c->profiles[i].file[0] == '\0') {
+        profile_t *p = &c->profiles[i];
+        if (p->file[0] == '\0') {
             if (verbose)
-                logmsg("profile '%s' has no file", c->profiles[i].name);
+                logmsg("profile '%s' has no file", p->name);
             err = 1;
+        }
+        /* every name a profile lists must resolve to a configured key — an unknown
+         * name would silently fail open (no acceptable key => not gated). */
+        if (p->keys[0]) {
+            char buf[sizeof(p->keys)];
+            snprintf(buf, sizeof(buf), "%s", p->keys);
+            for (char *tok = strtok(buf, ", \t"); tok; tok = strtok(NULL, ", \t"))
+                if (!key_find(c, tok)) {
+                    if (verbose)
+                        logmsg("profile '%s' references unknown signing key '%s'", p->name, tok);
+                    err = 1;
+                }
         }
     }
     if (c->arch[0] == '\0' || c->prefix[0] == '\0') {
@@ -956,7 +1090,7 @@ static void evaluate(void) {
         const char *sig = cJSON_IsString(jsig) ? jsig->valuestring : NULL;
         char mtopic[160];
         meta_topic_for(eff.from_machine, mtopic, sizeof(mtopic));
-        if (!sig_ok(mtopic, p->name, sha, size, entry_ts(entry), sig)) {
+        if (!sig_ok(mtopic, p, sha, size, entry_ts(entry), sig)) {
             snprintf(p->last_result, sizeof(p->last_result), "%s", "fail");
             continue;
         }
@@ -1084,9 +1218,21 @@ static int run_check(const char *cfgpath) {
         printf("CHECK FAILED: %s\n", cfgpath);
         return 1;
     }
-    printf("ok: %s — %d profile(s), signatures %s\n", cfgpath, c.nprofiles, c.sign_enabled ? "ENFORCED (pubkey present)" : "off (no pubkey)");
-    for (int i = 0; i < c.nprofiles; i++)
-        printf("  - %s -> %s%s%s%s\n", c.profiles[i].name, c.profiles[i].file, c.profiles[i].machine_specific ? " [machine-specific]" : "", c.profiles[i].service[0] ? " [svc:" : "", c.profiles[i].service);
+    printf("ok: %s — %d profile(s), %d signing key(s)", cfgpath, c.nprofiles, c.nkeys);
+    for (int i = 0; i < c.nkeys; i++)
+        printf("%s%s", i ? ", " : " [", c.keys[i].name);
+    printf("%s\n", c.nkeys ? "]" : "");
+    for (int i = 0; i < c.nprofiles; i++) {
+        profile_t *p = &c.profiles[i];
+        const unsigned char *pubs[MAX_KEYS];
+        int nk = profile_keys(&c, p, pubs, MAX_KEYS);
+        char svc[80] = "";
+        if (p->service[0])
+            snprintf(svc, sizeof(svc), " [svc:%s]", p->service);
+        printf("  - %s -> %s%s%s  [sig: %s]\n", p->name, p->file,
+               p->machine_specific ? " [machine-specific]" : "", svc,
+               nk ? (p->keys[0] ? p->keys : "default") : "off");
+    }
     return 0;
 }
 
@@ -1126,7 +1272,7 @@ static int run_status(const char *cfgpath) {
         }
     bool have_meta = g_meta_global || g_meta_machine;
 
-    printf("deployer status — arch=%s prefix=%s mac=%s signatures=%s\n", g_cfg.arch, g_cfg.prefix, g_cfg.macid, g_cfg.sign_enabled ? "ENFORCED" : "off");
+    printf("deployer status — arch=%s prefix=%s mac=%s signing-keys=%d\n", g_cfg.arch, g_cfg.prefix, g_cfg.macid, g_cfg.nkeys);
     printf("broker %s:%d — %s\n", g_cfg.broker, g_cfg.port, have_meta ? "connected, meta received" : (connected ? "connected, no meta published" : "UNREACHABLE"));
     printf("%-20s %-9s %-13s %-13s %-15s %-7s %-8s %s\n", "profile", "version", "installed", "advertised", "pushed", "src", "sig", "state");
     for (int i = 0; i < g_cfg.nprofiles; i++) {
@@ -1143,9 +1289,11 @@ static int run_status(const char *cfgpath) {
         const char *advsha = (js && cJSON_IsString(js)) ? js->valuestring : NULL;
         const char *src = !e ? "-" : (eff.from_machine ? "machine" : "global");
 
+        const unsigned char *pubs[MAX_KEYS];
+        int nk = profile_keys(&g_cfg, p, pubs, MAX_KEYS);
         const char *sig;
-        if (!g_cfg.sign_enabled)
-            sig = "off";
+        if (!nk)
+            sig = "off"; /* this profile isn't signature-gated */
         else if (!e)
             sig = "-";
         else if (!(jsig && cJSON_IsString(jsig)))
@@ -1154,7 +1302,7 @@ static int run_status(const char *cfgpath) {
             long sz = (jsz && cJSON_IsNumber(jsz)) ? (long)jsz->valuedouble : -1;
             char mt[160];
             meta_topic_for(eff.from_machine, mt, sizeof(mt));
-            sig = sig_ok(mt, p->name, advsha ? advsha : "", sz, entry_ts(e), jsig->valuestring) ? "valid" : "INVALID";
+            sig = sig_ok(mt, p, advsha ? advsha : "", sz, entry_ts(e), jsig->valuestring) ? "valid" : "INVALID";
         }
 
         const char *state;
