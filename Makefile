@@ -11,15 +11,18 @@ CFLAGS  = -O3 -Wall -Wextra -Wpedantic -Werror \
 LIBS    = -lmosquitto -lcjson -lcrypto
 
 TARGET  = mqtt-deployer
+# native = bare; cross = $(TARGET).<arch> via SUFFIX (the iotdata toolchain Makefile passes it).
+SUFFIX ?=
+BIN     = $(TARGET)$(SUFFIX)
 MAIN    = mqtt-deployer.c
 
-all: $(TARGET)
+all: $(BIN)
 
-$(TARGET): $(MAIN)
-	$(CC) $(CFLAGS) -o $(TARGET) $(MAIN) $(LIBS)
+$(BIN): $(MAIN)
+	$(CC) $(CFLAGS) -o $(BIN) $(MAIN) $(LIBS)
 
 clean:
-	rm -f $(TARGET) $(TARGET).armhf
+	rm -f $(TARGET) $(BIN) $(TARGET).armhf
 
 format:
 	clang-format -i $(MAIN)

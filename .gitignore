@@ -6,3 +6,5 @@ mqtt-deployer.armhf
 master/*.key
 master/iotdata-deploy-sign.*
 !master/iotdata-deploy-sign.pub
+*.aarch64
+*.armv6l

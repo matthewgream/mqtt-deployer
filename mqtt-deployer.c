@@ -46,6 +46,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -145,10 +146,18 @@ static char *lstrip(char *s) {
     return s;
 }
 
-/* device MAC (eth0 else wlan0), hex lowercase — same derivation as set-hostname */
+/* device MAC (hex lowercase). SINGLE SOURCE OF TRUTH: the hostname (iotdata-mac-<mac>), minted by
+ * hostname.service which runs before us — read it so the deployer can't drift from set-hostname. The
+ * wired-first interface scan (eth0 -> end0 -> wlan0) is the fallback, used only if the hostname isn't in
+ * that form yet (mirrors mac_id in iotdata-systemop). */
 static void get_mac(char *buf, size_t bufsz) {
     buf[0] = '\0';
-    const char *ifs[] = { "eth0", "wlan0", NULL };
+    char host[256];
+    if (gethostname(host, sizeof(host)) == 0 && strncmp(host, "iotdata-mac-", 12) == 0 && host[12]) {
+        snprintf(buf, bufsz, "%.*s", (int)bufsz - 1, host + 12); /* bounded -> keeps -Wformat-truncation quiet */
+        return;
+    }
+    const char *ifs[] = { "eth0", "end0", "wlan0", NULL };
     for (int i = 0; ifs[i]; i++) {
         char path[64];
         snprintf(path, sizeof(path), "/sys/class/net/%s/address", ifs[i]);
@@ -168,6 +177,15 @@ static void get_mac(char *buf, size_t bufsz) {
             return;
     }
     snprintf(buf, bufsz, "%s", "unknown");
+}
+
+/* device CPU arch (uname -m: armv6l, aarch64, x86_64) — the firmware-feed key; matches the release tree.
+ * uname's machine[] can be up to 65 bytes, so bound the copy to buf (the %.*s keeps -Wformat-truncation
+ * happy; real arch names are short, so this never truncates anything meaningful). */
+static void get_arch(char *buf, size_t bufsz) {
+    struct utsname u;
+    const char *m = (uname(&u) == 0 && u.machine[0]) ? u.machine : "unknown";
+    snprintf(buf, bufsz, "%.*s", (int)bufsz - 1, m);
 }
 
 /* substitute %mac% and %host% in a template into out */
@@ -531,7 +549,7 @@ static void config_defaults(config_t *c) {
     c->port = 1883;
     snprintf(c->broker, sizeof(c->broker), "%s", "localhost");
     snprintf(c->prefix, sizeof(c->prefix), "%s", "iotdata/firmware");
-    snprintf(c->arch, sizeof(c->arch), "%s", "armv6");
+    get_arch(c->arch, sizeof(c->arch)); /* default = this box's uname -m; `%arch%` or a literal in config overrides */
     c->retry_normal = 10800; /* 3h */
     c->retry_urgent = 300;   /* 5m */
     c->jitter = 0;
@@ -683,8 +701,12 @@ static int config_load(config_t *c, const char *path, bool verbose) {
                 snprintf(c->password, sizeof(c->password), "%s", val);
             else if (strcmp(key, "master-config") == 0)
                 snprintf(c->master_config, sizeof(c->master_config), "%s", val);
-            else if (strcmp(key, "arch") == 0)
-                snprintf(c->arch, sizeof(c->arch), "%s", val);
+            else if (strcmp(key, "arch") == 0) {
+                if (strcmp(val, "%arch%") == 0)
+                    get_arch(c->arch, sizeof(c->arch)); /* %arch% -> this box's uname -m (armv6l/aarch64/...) */
+                else
+                    snprintf(c->arch, sizeof(c->arch), "%s", val);
+            }
             else if (strcmp(key, "prefix") == 0)
                 snprintf(c->prefix, sizeof(c->prefix), "%s", val);
             else if (strcmp(key, "status-topic") == 0)
@@ -765,17 +787,27 @@ static int config_load(config_t *c, const char *path, bool verbose) {
         }
     }
     (void)fclose(f);
+    int mc_rc = 0; /* -1 = master-config FILE absent/unreadable (box not enrolled yet); 0 = present + read */
     if (c->master_config[0] != '\0')
-        (void)apply_master_config(c, verbose); /* best-effort; missing/unreadable -> keep legacy inline creds */
+        mc_rc = apply_master_config(c, verbose); /* best-effort; missing/unreadable -> keep legacy inline creds */
     /* master-pubkey=<name>: register the fleet signing key carried in master-config
      * (signing-pubkey=) under that name, so profiles accept it like any [keys] entry.
      * The deployer is key-provenance-agnostic — this is just where the fleet's key,
      * cut into the enrolment by the master, lands in the store. */
     if (c->master_pubkey_name[0]) {
         if (!c->signing_pubkey_b64[0]) {
-            if (verbose)
-                logmsg("master-pubkey=%s set but master-config carried no signing-pubkey", c->master_pubkey_name);
-            err = 1; /* fail-closed: asked to trust a key that isn't there */
+            if (mc_rc < 0) {
+                /* No master-config FILE yet => box not enrolled. Run with the static keys (the manufacturer
+                 * 'default' below); the fleet key auto-registers the moment the portal writes master-config.
+                 * NOT fatal — a fresh box must boot the deployer to receive manufacturer-signed updates. */
+                if (verbose)
+                    logmsg("master-pubkey=%s set but no master-config yet (not enrolled) — static keys only", c->master_pubkey_name);
+            } else {
+                /* master-config present + readable but carried no signing-pubkey => real misconfig: fail-closed. */
+                if (verbose)
+                    logmsg("master-pubkey=%s set but master-config carried no signing-pubkey", c->master_pubkey_name);
+                err = 1; /* fail-closed: asked to trust a key that isn't there */
+            }
         } else {
             unsigned char raw[48];
             if (b64decode(c->signing_pubkey_b64, raw, (int)sizeof(raw)) == 32) {
