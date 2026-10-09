@@ -16,8 +16,11 @@ AlignConsecutiveMacros:
   PadOperators: true
 AllowShortBlocksOnASingleLine: false
 AllowShortFunctionsOnASingleLine: None
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortEnumsOnASingleLine: false
 AlignEscapedNewlines: DontAlign
 SpacesInContainerLiterals: true
 Cpp11BracedListStyle: false
+BracedInitializerIndentWidth: 4
 SortIncludes: false
 ---
